@@ -1,9 +1,10 @@
-import {env} from "cloudflare:workers";
+import {env, RpcStub} from "cloudflare:workers";
 import {evictDurableObject, runInDurableObject} from "cloudflare:test";
 import {afterEach, describe, expect, it, vi} from "vitest";
 import type {OverseerDurableObject} from "../src/overseer";
 import {UserDurableObject} from "../src/user";
 import type {IntegrationTestParticipant} from "./test-worker";
+import {openFakeOverseer} from "./fixtures";
 
 declare module "cloudflare:workers" {
   interface ProvidedEnv {
@@ -52,6 +53,79 @@ function providerReply(): Response {
 
 describe("integration cleanup at agent recovery boundaries", () => {
   afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+
+  it.each(["before suspension", "during cleanup", "after teardown"] as const)("recovers an accepted connection wake-up %s across eviction", async boundary => {
+    const name = crypto.randomUUID(), stub = env.TEST_OVERSEER.getByName(name);
+    const user = env.TEST_USER.getByName(crypto.randomUUID());
+    await runInDurableObject(user, instance => {
+      instance["storage"].profile.put(USER);
+      instance["storage"].aiModels.put(MODEL);
+    });
+    let requests = 0;
+    const realFetch = globalThis.fetch;
+    vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      if (url.origin !== MODEL.config.apiUrl) return realFetch(input, init);
+      ++requests;
+      return Promise.resolve(providerReply());
+    });
+    await runInDurableObject(stub, async instance => {
+      const impl = instance.impl, participant = await prepare(impl, name);
+      const turn = impl.storage.agentIntegrationTurns.get(1)!;
+      const continuationId = crypto.randomUUID();
+      const record = {chatId: 1, initiatorUserId: user.id.toString(), modelId: MODEL.profile.id,
+        initiator: USER, callbackInitiated: false, continuationId, requestKey: turn.requestKey};
+      impl.storage.activeAgents.put(record);
+      if (boundary !== "before suspension") impl.storage.pausedAgents.put(record);
+      impl.storage.agentIntegrationTurns.put({...turn, continuationId});
+      impl.storage.chatMeta.put({...impl.storage.chatMeta.get(1)!, activeAgent: MODEL.profile});
+      impl.addChatMessages(1, MODEL.profile, [{type: "connectionRequest", requestId: "1:connection",
+        vendorId: "github", vendorName: "GitHub", reason: "Read repo", state: "pending"}]);
+      await participant.setFailure(true);
+      if (boundary !== "before suspension") {
+        await expect(impl.closeAgentIntegrationTurn(1, "connection")).rejects.toThrow(/unavailable/);
+      }
+      using client = new RpcStub(await openFakeOverseer({chats: impl.storage.chats, chatMeta: impl.storage.chatMeta,
+        pausedAgents: impl.storage.pausedAgents, activeAgents: impl.storage.activeAgents}, {impl: {resumePausedAgent: impl.resumePausedAgent.bind(impl),
+          getChatTimestamp: impl.getChatTimestamp.bind(impl)}}));
+      await client.acceptConnectionRequest("1:connection", {gatekeeperId: 31});
+      expect([...impl.storage.chats.list()].find(message => message.type === "connectionRequest"))
+        .toMatchObject({state: "accepted"});
+      expect(impl.storage.pausedAgents.get(1) ?? impl.storage.activeAgents.get(1))
+        .toMatchObject({continuationId, resumeRequested: true});
+      expect(requests).toBe(0);
+      if (boundary === "before suspension") {
+        // The ordinary turn finally copies its active record into the pause before callback I/O.
+        impl.storage.pausedAgents.put(impl.storage.activeAgents.get(1)!);
+        await expect(impl.closeAgentIntegrationTurn(1, "connection")).rejects.toThrow(/unavailable/);
+      }
+      await participant.setFailure(false);
+      if (boundary === "after teardown") {
+        await impl.closeAgentIntegrationTurn(1, "connection");
+        // Fault between clearing the busy record and dispatching the queued wake-up.
+        impl.storage.activeAgents.delete(1);
+        const meta = impl.storage.chatMeta.get(1)!;
+        delete meta.activeAgent;
+        impl.storage.chatMeta.put(meta);
+      }
+      await impl.ctx.storage.sync();
+    });
+    await evictDurableObject(stub);
+    await runInDurableObject(stub, async instance => {
+      const impl = instance.impl;
+      impl.env.AGENT_INTEGRATION_GRANTS = GRANT;
+      try {
+        // Constructor wake-up may still be waiting for message-preparation's microtask.
+        await vi.waitFor(() => expect(requests).toBe(1));
+        await impl.waitForAllAgentsToComplete();
+        expect(requests).toBe(1);
+        expect(impl.storage.activeAgents.get(1)).toBeUndefined();
+        expect(impl.storage.pausedAgents.get(1)).toBeUndefined();
+        expect(impl.storage.chatMeta.get(1)?.activeAgent).toBeUndefined();
+        expect(impl.storage.agentIntegrationTurns.get(1)?.closing?.kind).toBe("finished");
+      } finally { delete impl.env.AGENT_INTEGRATION_GRANTS; }
+    });
+  });
 
   it.each(["approval", "connection"] as const)("recovers interrupted %s teardown without inferring until an authorized wake-up", async reason => {
     const name = crypto.randomUUID(), stub = env.TEST_OVERSEER.getByName(name);

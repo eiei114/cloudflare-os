@@ -24,6 +24,14 @@ This project is building a platform for "vibe coded" personal applications and A
 - Serialize replica receipt/version checks with live appends, so expected duplicate/CAS retries
   never latch a fatal persistence error. Terminal replica cleanup is registered, ACK-fenced and
   has a fixed durable deadline that renewal cannot extend.
+- Drain ordinary step buffers inside that same serialized callback, not while enqueueing it:
+  a replica append can yield before its commit, and an ordinary step must never take those edits.
+- Journal authorized connection wake-ups on their original continuation before yielding, including
+  before the pause is recorded and during lifecycle cleanup; consume them after teardown or reset.
+- Replica leaf enumeration excludes directories. Reuse file-tool tree-entry writability checks
+  before accepting mutations, rather than treating an absent leaf as proof of an absent path.
+- Compare large upload round trips with byte length plus native hashes, not element-by-element
+  assertion walkers. Dispose test client/notification capabilities before graceful DO eviction.
 - Attachment projection must commit with its validated message. Prefetch bytes/tree metadata first;
   a rejected send must leave uploads staged and must not consume a workspace filename.
 - Lifecycle callbacks retain registration-scoped worktree selections; never rebuild their authority

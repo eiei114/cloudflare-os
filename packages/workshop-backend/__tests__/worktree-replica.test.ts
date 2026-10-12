@@ -167,6 +167,7 @@ function fixture(before: string | null = "one\ntwo\n") {
   const host: WorktreeReplicaHost = {
     requireLease: requireLive, saveLease: value => { lease = value; },
     capture: async () => ({ cursor: "cursor-0", overlay: [] }),
+    assertPathWritable: async () => {},
     entries: async () => [...initial].map(([path]) => ({ path, mode: "100644", oid: "blob" })),
     baseFile: async (_lease, id, path) => {
       if (id !== 7 || !initial.has(path)) throw new Error("missing file");
@@ -390,7 +391,8 @@ describe("scoped native worktree replica protocol", () => {
   it("rejects binary and symlink mutations explicitly", async () => {
     const f = fixture("\0binary"); await f.session.checkpoint();
     await expect(f.session.submitBatch(await batch("\0binary", "text"))).rejects.toThrow(/binary/);
-    const g = fixture(); g.host.entries = async () => [{ path: "a.txt", mode: "120000", oid: "link" }];
+    const g = fixture();
+    g.host.assertPathWritable = async () => { throw new Error("Replica mutations of symlinks are unsupported."); };
     await g.session.checkpoint();
     await expect(g.session.submitBatch(await batch())).rejects.toThrow(/symlinks/);
   });

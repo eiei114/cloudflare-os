@@ -1171,6 +1171,8 @@ class OverseerImpl implements AgentHooks {
 
     if (this.hasPendingAgentCalls(chatId)) {
       this.drainPendingAgentCalls(chatId);
+    } else if (this.storage.pausedAgents.get(chatId)?.resumeRequested) {
+      this.ctx.waitUntil(this.resumePausedAgent(chatId));
     } else {
       this.#deliverWaitingExternalMessageResponse(chatId);
     }
@@ -1254,6 +1256,12 @@ class OverseerImpl implements AgentHooks {
       let liveChat = this.#getLiveChat(record.chatId);
 
       this.ctx.waitUntil(this.#resumeAgent(record, liveChat));
+    }
+    // A reset can land after teardown cleared activeAgents but before its queued wake-up ran.
+    for (const record of this.storage.pausedAgents.list()) {
+      if (record.resumeRequested && !this.#runningAgents.has(record.chatId)) {
+        this.ctx.waitUntil(this.resumePausedAgent(record.chatId));
+      }
     }
 
     // Backwards compatibility: Prior to the introduction of the `activeAgents` table, we could
@@ -5086,6 +5094,14 @@ class OverseerImpl implements AgentHooks {
   // Persist active resumption before starting async model resolution, so another reset or
   // concurrent approval neither loses this wake-up nor starts a duplicate agent loop.
   async resumePausedAgent(chatId: number, fallbackUserId?: string, author?: AiChatAuthorInfo): Promise<void> {
+    // Accepting a connection during a suspended callback is still an authorized wake-up.
+    // Persist it before yielding; teardown (or constructor recovery) consumes this exact pause.
+    const paused = this.storage.pausedAgents.get(chatId);
+    if (paused) this.storage.pausedAgents.put({...paused, resumeRequested: true});
+    else {
+      const active = this.storage.activeAgents.get(chatId);
+      if (active) this.storage.activeAgents.put({...active, resumeRequested: true});
+    }
     await this.waitForChatMessagePreparation(chatId);
     const meta = this.storage.chatMeta.get(chatId);
     if (!meta || meta.activeAgent || this.#runningAgents.has(chatId)) return;
@@ -5097,6 +5113,7 @@ class OverseerImpl implements AgentHooks {
         initiator: author, callbackInitiated: false };
     }
     if (!record) throw new Error("Paused agent origin unavailable; manual resumption is required.");
+    delete record.resumeRequested;
     this.storage.activeAgents.put(record);
     this.storage.pausedAgents.delete(chatId);
     this.#registerRunningAgent(chatId);
@@ -6539,6 +6556,10 @@ class OverseerImpl implements AgentHooks {
           expiresAt: Math.min(lease.expiresAt, current.cleanupDeadline ?? Infinity)});
       },
       entries, baseFile,
+      assertPathWritable: async (lease, checkoutId, path) => {
+        const tree = requireTree(lease, checkoutId);
+        if (tree.baseCommit) await this.gitCache.assertWorktreePathWritable(tree.baseCommit, path);
+      },
       gitPack: async (lease, checkoutId, request) => {
         const commit = lease.worktrees.find(tree => tree.checkoutId === checkoutId)?.baseCommit;
         if (!commit) throw new Error("Repository has no immutable source commit.");
@@ -12219,7 +12240,8 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   // Restart a suspended agent turn after its outcome is recorded in chat history (accepted
   // connection, or all awaited actions approved). Denials intentionally don't call this.
   async #resumeSuspendedAgent(chatId: number): Promise<void> {
-    if (this.impl.storage.pausedAgents.get(chatId)) {
+    if (this.impl.storage.pausedAgents.get(chatId) ||
+        this.impl.storage.chatMeta.get(chatId)?.activeAgent && this.impl.storage.activeAgents.get(chatId)) {
       await this.impl.resumePausedAgent(chatId);
       return;
     }

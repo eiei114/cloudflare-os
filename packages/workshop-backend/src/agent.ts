@@ -4242,27 +4242,29 @@ async function runAgentPass(
         // The barrier itself: one transaction persists the step's messages and its buffered
         // effects -- rows, the step's single "changes" message, retirement, registry stamps --
         // so the effects are durable iff the transcript that explains them is. The buffer is
-        // drained before the call: if the barrier throws, the turn dies with it (rethrown out
-        // of the loop), and re-delivering the step's changes anywhere would be wrong.
-        let stepChanges = stepBuffer.changes;
-        stepBuffer.changes = [];
-        stepBuffer.bytes = 0;
-        let createdGadgets = pendingCreatedGadgets;
-        pendingCreatedGadgets = [];
-        let createdWorktrees = pendingCreatedWorktrees;
-        pendingCreatedWorktrees = [];
-        let addedBindings = pendingAddedBindings;
-        pendingAddedBindings = [];
-        let worktreeCommits = pendingWorktreeCommits;
-        pendingWorktreeCommits = [];
-        let blueprintMerges = pendingBlueprintMerges;
-        pendingBlueprintMerges = [];
-        await persistStep(async () => { if (await hooks.commitAgentStep(chatId, author, msgs,
-            {changes: stepChanges, createdGadgets, createdWorktrees, addedBindings,
-             worktreeCommits, blueprintMerges},
-            message.usage, handle.lastResponse?.aiGatewayLogId, handle.aiGatewayLogRoute)) {
-          ++nextChangeId;
-        } });
+        // drained inside the serialized operation, so it cannot take an in-flight replica's edits.
+        // If the barrier throws, the turn dies with it and re-delivering the effects would be wrong.
+        await persistStep(async () => {
+          let stepChanges = stepBuffer.changes;
+          stepBuffer.changes = [];
+          stepBuffer.bytes = 0;
+          let createdGadgets = pendingCreatedGadgets;
+          pendingCreatedGadgets = [];
+          let createdWorktrees = pendingCreatedWorktrees;
+          pendingCreatedWorktrees = [];
+          let addedBindings = pendingAddedBindings;
+          pendingAddedBindings = [];
+          let worktreeCommits = pendingWorktreeCommits;
+          pendingWorktreeCommits = [];
+          let blueprintMerges = pendingBlueprintMerges;
+          pendingBlueprintMerges = [];
+          if (await hooks.commitAgentStep(chatId, author, msgs,
+              {changes: stepChanges, createdGadgets, createdWorktrees, addedBindings,
+               worktreeCommits, blueprintMerges},
+              message.usage, handle.lastResponse?.aiGatewayLogId, handle.aiGatewayLogRoute)) {
+            ++nextChangeId;
+          }
+        });
 
         // Reset per-step streaming state.
         toolCallNotes.clear();

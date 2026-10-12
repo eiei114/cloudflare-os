@@ -1,11 +1,12 @@
-import {describe, expect, it} from "vitest";
+import {describe, expect, it, vi} from "vitest";
 import {env} from "cloudflare:workers";
 import {abortAllDurableObjects, runInDurableObject} from "cloudflare:test";
 import type {OverseerDurableObject} from "../src/overseer";
 import type {UserDurableObject} from "../src/user";
 import {applyCodeChange, MAX_FILE_TEXT_LENGTH, type CodeChange} from "@gadgets/workshop-shared/code-change";
 import {replicaTextHash} from "../src/workspace-replica";
-import {runAgent} from "../src/agent";
+import {runAgent, type WorktreeTurnAccess} from "../src/agent";
+import type {WorktreeReplicaCommit} from "../src/worktree-replica";
 import {createFauxCore, fauxAssistantMessage, fauxText, fauxToolCall} from "@earendil-works/pi-ai";
 import type {IntegrationTestParticipant} from "./test-worker";
 
@@ -53,6 +54,65 @@ async function open(impl: Impl, chatId = 1, gatekeeperId = 31) {
 }
 
 describe("replica review regressions over durable kernel storage", () => {
+  it.each(["set", "remove"] as const)("rejects a base-directory %s before ACK and permits a valid retry", mode => inKernel(crypto.randomUUID(), async impl => {
+    const tree = await worktree(impl, 1, new Map([["src/a.txt", "aaa"]]));
+    await impl.beginAgentIntegrationTurn(1);
+    const replica = await open(impl), checkpoint = await replica.checkpoint();
+    await expect((async () => replica.submitBatch({batchId: "directory", baseCursor: checkpoint.cursor, files: [
+      {checkoutId: tree.id, path: "src", baseHash: null, change: mode === "set" ? {set: "replacement"} : {remove: true}},
+    ]}))()).rejects.toThrow(/directory/);
+    expect([...impl.storage.worktreeReplicaCommits.list()]).toEqual([]);
+    expect([...impl.storage.chatChanges.list()]).toEqual([]);
+    await replica.submitBatch({batchId: "directory", baseCursor: checkpoint.cursor, files: [
+      {checkoutId: tree.id, path: "src/a.txt", baseHash: await replicaTextHash("aaa"), change: {set: "valid"}},
+    ]});
+    expect(await impl.mergeChanges(1, {profile: USER}, USER.id)).toEqual({outcome: "merged"});
+  }));
+
+  it("persists replica edits and echo provenance before ACK when turn_end queues concurrently", () => inKernel(crypto.randomUUID(), async impl => {
+    const tree = await worktree(impl);
+    impl.addChatMessages(1, USER, [{type: "message", message: "Finish while the replica writes."}]);
+    await impl.beginAgentIntegrationTurn(1);
+    let access!: WorktreeTurnAccess;
+    const register = impl.registerWorktreeReplicaTurn.bind(impl);
+    impl.registerWorktreeReplicaTurn = (...args) => { access = args[1]; register(...args); };
+    const endpoint = await open(impl), checkpoint = await endpoint.checkpoint();
+    const leaseId = checkpoint.cursor.split(":")[0];
+    const receipt: WorktreeReplicaCommit = {id: `${leaseId}:concurrent-step`, leaseId, digest: "fixture",
+      receipt: {batchId: "concurrent-step", committedAt: "pending", corrections: [], accepted: []}};
+    let ack: Promise<boolean> | undefined;
+    const consume = impl.consumeCapturedActions.bind(impl);
+    impl.consumeCapturedActions = chatId => {
+      // finishTurn starts the replica barrier. Its synchronous append then yields at await,
+      // exactly when pi dispatches turn_end and queues the ordinary persistence barrier.
+      ack = access.flushReplica!({[tree.id]: [["a.txt", {set: "replica edit"}]]}, access.getRevision!(), receipt);
+      return consume(chatId);
+    };
+    let release!: () => void;
+    const ordinary = new Promise<void>(resolve => { release = resolve; });
+    const commit = impl.commitAgentStep.bind(impl);
+    impl.commitAgentStep = async (...args) => {
+      if (args[2].length) await ordinary;
+      return commit(...args);
+    };
+    const faux = createFauxCore({models: [{id: "faux-model"}]});
+    faux.setResponses([fauxAssistantMessage(fauxText("Done."))]);
+    const running = runAgent(impl, {model: faux.getModel(), stream: faux.stream}, 1, AUTHOR,
+      new AbortController().signal, USER, {provider: "cloudflare", model: "faux-model", apiToken: ""});
+    try {
+      await vi.waitFor(() => expect(ack).toBeDefined());
+      expect(await ack).toBe(true);
+      expect(impl.storage.worktreeReplicaCommits.get(receipt.id)).toBeDefined();
+      expect((await impl.getCurrentChatContent(1, impl.storage.chatMeta.get(1)!)).get(tree.id)?.get("a.txt"))
+        .toBe("replica edit");
+      const page = await endpoint.changesSince(checkpoint.cursor, 128);
+      expect(page.events.find(event => event.changes.length)).toMatchObject({sourceBatchId: "concurrent-step", changes: [
+        {checkoutId: tree.id, path: "a.txt", change: {set: "replica edit"}},
+      ]});
+      expect(page.events.every(event => event.sourceBatchId === "concurrent-step")).toBe(true);
+    } finally { release(); }
+    await running;
+  }));
   it.each(["completed", "canceled", "failed"] as const)("revokes an unregistered replica after the turn is %s", reason => inKernel(crypto.randomUUID(), async impl => {
     const tree = await worktree(impl);
     await impl.beginAgentIntegrationTurn(1);
@@ -436,7 +496,11 @@ describe("replica review regressions over durable kernel storage", () => {
       ? await impl.newChat(user, {profile: USER}, "Initial", undefined, [stage(new TextEncoder().encode("small"), "small.txt")])
       : await impl.newChat(user, {profile: USER}, "Read this", undefined, [upload]);
     if (existing) await impl.sendChatMessage(user, {profile: USER}, chatId, "Read this", undefined, [upload]);
-    expect(await impl.getChatAttachmentData(chatId, upload.id)).toEqual(bytes);
+    const returned = await impl.getChatAttachmentData(chatId, upload.id);
+    expect(returned.byteLength).toBe(bytes.byteLength);
+    // A half-megabyte element-by-element matcher dominates this regression on CI. Verify
+    // byte identity in native crypto instead, without weakening the byte-backed round trip.
+    expect(await crypto.subtle.digest("SHA-256", returned)).toEqual(await crypto.subtle.digest("SHA-256", bytes));
     expect(impl.storage.chatAttachmentContent.get(upload.id)?.state).toMatchObject({type: "committed", chatId});
     expect(impl.storage.chatAttachmentContent.get(upload.id)?.state).not.toHaveProperty("workspacePath");
     if (!existing) expect(impl.getChatAgentContext(chatId).attachments).toBeUndefined();

@@ -800,6 +800,8 @@ export type ActiveAgentRecord = {
   continuationId?: string;
   /** Initiating request, captured before async startup; fences cleanup from an older prompt. */
   requestKey?: string;
+  /** Authorized wake-up received while this continuation is still entering/tearing down a pause. */
+  resumeRequested?: true;
 };
 
 /** Approved intent only for integrations explicitly granted durable effect recovery. */

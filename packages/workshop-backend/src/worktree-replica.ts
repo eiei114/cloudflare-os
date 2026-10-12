@@ -18,6 +18,8 @@ export interface WorktreeReplicaHost {
   capture(lease: WorktreeReplicaLease): Promise<{ cursor: string; overlay: WorktreeChange[] }>;
   entries(lease: WorktreeReplicaLease, checkoutId: number): Promise<WorktreeBaseEntry[]>;
   baseFile(lease: WorktreeReplicaLease, checkoutId: number, path: string): Promise<Uint8Array>;
+  /** Reuse ordinary file-tool checks against the immutable tree, including directory entries. */
+  assertPathWritable(lease: WorktreeReplicaLease, checkoutId: number, path: string): Promise<void>;
   /** Fetch only a lease-selected immutable repository commit, without storing its blobs. */
   gitPack?(lease: WorktreeReplicaLease, checkoutId: number, request: Uint8Array): Promise<ReadableStream<Uint8Array>>;
   events(lease: WorktreeReplicaLease, cursor: string, limit: number): WorktreeChangesPage;
@@ -138,15 +140,12 @@ export class WorktreeReplicaSession extends RpcTarget implements Pick<WorkspaceR
           const key = `${file.checkoutId}:${file.path}`;
           if (seen.has(key)) throw new Error("Duplicate replica path.");
           seen.add(key);
+          await this.host.assertPathWritable(lease, file.checkoutId, file.path);
           // Reconstruct exactly the anchor the caller claims, never trust a supplied 'before'.
           const anchor = await this.#anchor(lease, file.checkoutId, file.path, batch.baseCursor);
           if (await replicaTextHash(anchor) !== file.baseHash)
             throw new Error("Replica anchor does not match the consumed canonical cursor.");
           anchored.push({path: file.path, before: anchor, change: file.change});
-          const entry = (await this.host.entries(lease, file.checkoutId)).find(candidate => candidate.path === file.path);
-          if (entry && entry.mode !== "100644" && entry.mode !== "100755") {
-            throw new Error("Replica mutations of symlinks and Gitlinks are unsupported.");
-          }
         }
         if (!files.length) continue;
         const merged = await mergeReplicaBatch(tree.checkoutId, { batchId: batch.batchId, files: anchored },

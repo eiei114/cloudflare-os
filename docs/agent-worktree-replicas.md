@@ -47,6 +47,10 @@ Interrupted suspension cleanup retains the paused continuation without inferring
 decision wake-up removes that marker. Cancellation during recovery's awaited reconciliation/model
 lookup clears running/visible busy state, fenced by continuation and live context so old cleanup
 cannot clear a newer execution.
+Connection acceptance journals a wake-up on that continuation even before suspension is recorded
+or while its callback is still running. Teardown consumes the marker after clearing busy state;
+constructor recovery also consumes it if reset interrupts that hand-off. Cancellation or a new
+execution removes the old marker, and an undecided/denied connection does not request a wake-up.
 If model recovery fails, terminal callbacks are journalled before active state is cleared and the alarm
 retries failed cleanup. Malformed model transforms are rejected before buffering and logged with only
 stage/count diagnostics, preserving their tool-error transcript instead of aborting at persistence.
@@ -77,6 +81,8 @@ barrier from a dispatched model request; stream creation is not receipt of provi
    Both accepted OTs and durable correction receipts are bounded before the persistence barrier.
    Even a no-op from a stale cursor can need large corrections; an oversized receipt is rejected
    without committing or consuming its batch ID. Catch up canonical events or submit fewer paths.
+   The immutable tree's ordinary file-tool writability checks reject directories, symlinks and
+   Gitlinks before ACK. Leaf-only base enumeration does not establish that a path is absent.
 6. Renew within the original grant/turn bounds; release fences further writes without removing
    already accepted changes. Live leases retain their required journal rows beyond the ordinary
    retired-row TTL, so caught-up clients can reconstruct anchors after long commands or DO resets.
@@ -88,6 +94,9 @@ for no-op batches. Ordinary DO edits flushed at the same barrier are not tagged.
 are lease-local: another replica never mistakes a coincidentally equal batch ID for its own write.
 The live barrier serializes receipt/version revalidation with append and persistence, so a
 concurrent duplicate no-op returns the stored receipt without poisoning subsequent agent steps.
+Ordinary model steps drain their buffers inside the same queue, so a concurrent `turn_end` cannot
+detach replica edits between append and persistence. ACKs therefore retain both durable edits and
+their lease-local echo provenance even while the ordinary transcript commit is still waiting.
 
 UTF-8 text attachments within the OT text-size limit become ordinary worktree files; BOMs are
 preserved as content, and downloads read the original Git blob bytes. Upload names reserve existing
