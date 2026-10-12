@@ -21,7 +21,8 @@ export interface WorktreeReplicaHost {
   /** Fetch only a lease-selected immutable repository commit, without storing its blobs. */
   gitPack?(lease: WorktreeReplicaLease, checkoutId: number, request: Uint8Array): Promise<ReadableStream<Uint8Array>>;
   events(lease: WorktreeReplicaLease, cursor: string, limit: number): WorktreeChangesPage;
-  readCanonical(lease: WorktreeReplicaLease, checkoutId: number, path: string): Promise<string | undefined>;
+  /** Publish buffered DO operations through the ordinary step barrier before reconciliation. */
+  flush(lease: WorktreeReplicaLease): Promise<boolean>;
   version(lease: WorktreeReplicaLease): string;
   getCommit(id: string): WorktreeReplicaCommit | undefined;
   commit(lease: WorktreeReplicaLease, version: string, change: CodeChange,
@@ -122,7 +123,9 @@ export class WorktreeReplicaSession extends RpcTarget implements Pick<WorkspaceR
         return prior.receipt;
       }
       if (!lease.checkpoint) throw new Error("Replica needs a checkpoint.");
+      if (!await this.host.flush(lease)) continue;
       const version = this.host.version(lease);
+      const remote = this.#changes(lease, batch.baseCursor, batch.files);
       const seen = new Set<string>();
       let change: CodeChange = {};
       const receipt: WorktreeReplicaReceipt = { batchId: batch.batchId, committedAt: crypto.randomUUID(),
@@ -137,9 +140,9 @@ export class WorktreeReplicaSession extends RpcTarget implements Pick<WorkspaceR
           seen.add(key);
           // Reconstruct exactly the anchor the caller claims, never trust a supplied 'before'.
           const anchor = await this.#anchor(lease, file.checkoutId, file.path, batch.baseCursor);
-          if ("change" in file ? await replicaTextHash(anchor) !== file.baseHash : anchor !== file.before)
+          if (await replicaTextHash(anchor) !== file.baseHash)
             throw new Error("Replica anchor does not match the consumed canonical cursor.");
-          anchored.push("change" in file ? {path: file.path, before: anchor, change: file.change} : file);
+          anchored.push({path: file.path, before: anchor, change: file.change});
           const entry = (await this.host.entries(lease, file.checkoutId)).find(candidate => candidate.path === file.path);
           if (entry && entry.mode !== "100644" && entry.mode !== "100755") {
             throw new Error("Replica mutations of symlinks and Gitlinks are unsupported.");
@@ -147,13 +150,11 @@ export class WorktreeReplicaSession extends RpcTarget implements Pick<WorkspaceR
         }
         if (!files.length) continue;
         const merged = await mergeReplicaBatch(tree.checkoutId, { batchId: batch.batchId, files: anchored },
-          path => this.host.readCanonical(lease, tree.checkoutId, path));
+          remote[tree.checkoutId] ? {[tree.checkoutId]: remote[tree.checkoutId]} : {});
         change = composeCodeChange(change, merged.change);
         receipt.corrections.push(...merged.ack.changes.map(([path, correction]) => ({ checkoutId: tree.checkoutId, path, change: correction })));
         for (const [path, content] of merged.ack.accepted)
-          receipt.accepted.push(files.some(file => file.path === path && "change" in file)
-            ? {checkoutId: tree.checkoutId, path, hash: await replicaTextHash(content)}
-            : {checkoutId: tree.checkoutId, path, content});
+          receipt.accepted.push({checkoutId: tree.checkoutId, path, hash: await replicaTextHash(content)});
       }
       if (seen.size !== batch.files.length) throw new Error("Replica batch names an ungranted checkout.");
       if (codeChangeSerializedSize(change) > 1024 * 1024) throw new Error("Replica OT transaction exceeds its budget.");
@@ -199,19 +200,31 @@ export class WorktreeReplicaSession extends RpcTarget implements Pick<WorkspaceR
       }
     };
     apply(lease.checkpoint!.overlay);
-    let position = lease.checkpoint!.cursor;
-    for (let pages = 0; position !== cursor; ++pages) {
-      if (pages >= 128) throw new Error("Replica anchor history exceeds its replay budget; checkpoint again.");
-      const page = this.host.events(lease, position, 128);
-      let found = false;
-      for (const event of page.events) {
-        apply(event.changes);
-        position = event.cursor;
-        if (position === cursor) { found = true; break; }
-      }
-      if (!found && (!page.hasMore || !page.events.length)) throw new Error("Unknown replica anchor cursor.");
-    }
+    content = applyCodeChange(content, this.#changes(lease, lease.checkpoint!.cursor,
+      [{checkoutId, path}], cursor));
     return content.get(checkoutId)?.get(path) ?? null;
+  }
+
+  #changes(lease: WorktreeReplicaLease, from: string,
+      paths: Pick<WorktreeChange, "checkoutId" | "path">[], through?: string): CodeChange {
+    const selected = new Set(paths.map(item => `${item.checkoutId}:${item.path}`));
+    let change: CodeChange = {}, position = from;
+    while (position !== through) {
+      const page = this.host.events(lease, position, 128);
+      for (const event of page.events) {
+        for (const item of event.changes) if (selected.has(`${item.checkoutId}:${item.path}`)) {
+          change = composeCodeChange(change, {[item.checkoutId]: [[item.path, item.change]]});
+        }
+        position = event.cursor;
+        if (position === through) return change;
+      }
+      if (!page.hasMore) {
+        if (through !== undefined) throw new Error("Unknown replica anchor cursor.");
+        return change;
+      }
+      if (!page.events.length) throw new Error("Replica journal made no progress.");
+    }
+    return change;
   }
 }
 

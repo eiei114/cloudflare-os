@@ -412,7 +412,7 @@ describe("worktree replica storage migration", () => {
     await inOverseer(name, async impl => {
       expect(impl.storage.version.get()).toBe(OVERSEER_STORAGE_VERSION);
       expect(impl.storage.chatContext.get(1)).toEqual({chatId: 1, bindings: {REPO: 7}});
-      expect([...impl.storage.workspaceRepositories.list()]).toEqual([]);
+      expect([...impl.storage.worktreeBaseChanges.list()]).toEqual([]);
       expect([...impl.storage.worktreeReplicaLeases.list()]).toEqual([]);
       expect([...impl.storage.actionApplications.list()]).toEqual([]);
       expect([...impl.storage.gitObjects.list()]).toEqual([]);

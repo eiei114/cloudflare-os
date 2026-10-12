@@ -32,9 +32,9 @@ import type { UserDurableObject } from "../user";
 export const OVERSEER_STORAGE_VERSION = 6;
 
 /**
- * Version 5 -> 6: enable integration journals and repository/check-out identities.
- * The new collections start empty; existing repository identities and text attachment ingress
- * are provisioned lazily, and legacy actions retain their manual retry contract.
+ * Version 5 -> 6: enable integration journals and accepted worktree OT prefixes.
+ * The new collections start empty; existing worktrees use their current accepted commit as
+ * hydration anchor until their next accept. Legacy actions retain their manual retry contract.
  */
 export function migrateToWorktreeReplicas(host: OverseerMigrationHost): void {
   if (host.storage.version.get() !== 5) return;

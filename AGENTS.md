@@ -1,5 +1,19 @@
 This project is building a platform for "vibe coded" personal applications and AI agents that run inside a strong sandbox.
 
+## Replica OT discipline
+
+- Integrations calculate filesystem deltas; the kernel validates scope/anchors and uses the existing
+  shared OT engine to order them. Never reconstruct canonical operations by diffing resulting text:
+  repeated text can give the same bytes a different insertion position and change collision results.
+- Preserve composed deltas across accepts/compaction and retain anchor history for live replica leases.
+  Test actual operation sequences and compact wire/storage size, not only final file contents.
+- Approval concurrency tests must release their effect barrier before awaiting joined approvals;
+  otherwise a test can deadlock against correct single-flight behavior.
+- Match the Node version pinned in CI when diagnosing test failures. A newer Node major can shadow
+  jsdom's `localStorage`; excessive parallel workerd fleets can also cause exit 137 locally.
+- Verify newly added regressions actually execute with direct Vitest or `vp run --no-cache`;
+  a successful cached run can replay an older test count, especially for untracked test files.
+
 ## Durable Object reset discipline
 
 Durable Objects reset frequently, including during long RPC calls. Treat resets as a normal

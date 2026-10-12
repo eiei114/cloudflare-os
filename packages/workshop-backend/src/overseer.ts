@@ -20,7 +20,7 @@ import {
   type ExternalChatRecord, type ExternalMessageRecord, type GadgetRecord, type GatekeeperCaller,
   type GatekeeperClass, type GatekeeperRecord, type ObserverRecord, type OverseerStorage,
   type StoredAssistantMessage, type StoredChatMessage, type StoredChatMetadata,
-  type WorkpieceRecord, type WorktreeRecord, type WorkspaceCheckoutRecord,
+  type WorkpieceRecord, type WorktreeRecord,
 } from "./storage-schema/overseer-storage";
 import type { UserAiModelRecord, WorkspaceOutputEntry } from "./storage-schema/user-storage";
 import {
@@ -1261,48 +1261,6 @@ class OverseerImpl implements AgentHooks {
     return id;
   }
 
-  #allocateRepositoryId(): number {
-    let id = this.storage.nextRepositoryId.get();
-    this.storage.nextRepositoryId.put(id + 1);
-    return id;
-  }
-
-  #checkoutMetadata(workpieceId: WorkpieceId): WorkspaceCheckoutRecord {
-    let existing = this.storage.workspaceCheckouts.get(workpieceId);
-    if (existing !== undefined) return existing;
-    let workpiece = this.storage.gadgets.get(workpieceId);
-    if (workpiece === undefined) throw new Error(`No such workpiece: ${workpieceId}`);
-
-    let sourceGatekeeperId = workpiece.type === "worktree"
-        ? workpiece.sourceGatekeeperId : undefined;
-    let repository = sourceGatekeeperId === undefined ? undefined :
-        [...this.storage.workspaceRepositories.bySourceGatekeeper.get(sourceGatekeeperId)][0];
-    if (repository === undefined) {
-      let source = sourceGatekeeperId === undefined
-          ? undefined : this.storage.gatekeepers.get(sourceGatekeeperId);
-      repository = {
-        id: this.#allocateRepositoryId(),
-        kind: workpiece.type === "gadget" ? "gadget" : "external",
-        title: source?.resourceTitle ?? workpiece.title,
-        created: new Date(),
-        ...(sourceGatekeeperId !== undefined ? {sourceGatekeeperId} : {}),
-        ...(source?.resourceUrl !== undefined ? {resourceUrl: source.resourceUrl} : {}),
-      };
-      this.storage.workspaceRepositories.put(repository);
-    }
-
-    let base = (workpiece.type === "gadget" ? workpiece.bindingName : workpiece.title)
-        .toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48);
-    let checkout: WorkspaceCheckoutRecord = {
-      workpieceId,
-      repositoryId: repository.id,
-      mountName: `${base || "checkout"}-${workpieceId}`,
-      created: new Date(),
-    };
-    this.storage.workspaceCheckouts.put(checkout);
-    return checkout;
-  }
-
   // Resolve an optional gadget reference: absent means the workspace's default gadget. Throws if
   // absent and the workspace has no default gadget.
   resolveGadgetId(gadgetId?: WorkpieceId): WorkpieceId {
@@ -1754,13 +1712,10 @@ class OverseerImpl implements AgentHooks {
         .filter(meta => this.proposedChangeWorkpieceIds(meta.id, meta).includes(id));
     let facetName = this.gadgetFacetName(id);
     this.storage.gadgets.delete(id);  // notifies workpiece subscribers
-    let checkout = this.storage.workspaceCheckouts.get(id);
-    if (checkout !== undefined) {
-      this.storage.workspaceCheckouts.delete(id);
-      if (![...this.storage.workspaceCheckouts.list()]
-          .some(other => other.repositoryId === checkout.repositoryId)) {
-        this.storage.workspaceRepositories.delete(checkout.repositoryId);
-      }
+    // Deleting through this index invalidates its live iterator.
+    const prefixes = [...this.storage.worktreeBaseChanges.byWorkpiece.get(id)];
+    for (const prefix of prefixes) {
+      this.storage.worktreeBaseChanges.deleteRecord(prefix);
     }
     this.#runningChatIds.delete(id);
     this.ctx.facets.delete(facetName);
@@ -2417,7 +2372,8 @@ class OverseerImpl implements AgentHooks {
   #appendChatChangeRow(chatId: number, meta: AiChatMetadata, author: AiChatAuthorInfo,
                        change: CodeChange,
                        newPins: ChatGadgetPinState[], contentAfter: CodeContent | undefined,
-                       submission?: {clientId: string, seq: number}): ChatChangeRecord {
+                       submission?: {clientId: string, seq: number},
+                       sourceReplica?: ChatChangeRecord["sourceReplica"]): ChatChangeRecord {
     let codeBase = this.chatCodeBase(meta);
     codeBase.pins.push(...newPins);
     let revision = codeBase.revision + 1;
@@ -2432,6 +2388,7 @@ class OverseerImpl implements AgentHooks {
       author,
       change,
       ...(submission !== undefined ? {submission} : {}),
+      ...(sourceReplica !== undefined ? {sourceReplica} : {}),
     };
     this.storage.chatChanges.put(row);
 
@@ -2482,8 +2439,16 @@ class OverseerImpl implements AgentHooks {
   // are no longer bridgeable at all.
   #pruneRetiredChatChanges(chatId: number): void {
     let cutoff = Date.now() - CHAT_CHANGE_RETIRED_TTL_MS;
+    const turn = this.storage.agentIntegrationTurns.get(chatId);
+    const anchors = [...this.storage.worktreeReplicaLeases.list()].filter(lease =>
+      lease.chatId === chatId && !lease.released && lease.expiresAt > Date.now() &&
+      lease.turnId === turn?.turnId && lease.checkpoint).map(lease => {
+        const [generation, revision] = lease.checkpoint!.cursor.split(":").slice(-2).map(Number);
+        return {generation, revision};
+      });
     for (let row of Array.from(this.storage.chatChanges.list({prefix: chatKeyPrefix(chatId)}))) {
-      if (row.retired && row.timestamp.getTime() < cutoff) {
+      if (row.retired && row.timestamp.getTime() < cutoff && !anchors.some(anchor =>
+          anchor.generation === row.generation && row.revision > anchor.revision)) {
         this.storage.chatChanges.deleteRecord(row);
       }
     }
@@ -2906,7 +2871,7 @@ class OverseerImpl implements AgentHooks {
           }
           let content = cached.content;
 
-          for (let {change, pin} of step.changes) {
+          for (let {change, pin, replica} of step.changes) {
             let newPins: ChatGadgetPinState[] = [];
             if (pin !== undefined) {
               let pins = this.chatCodeBase(fresh).pins;
@@ -2937,7 +2902,9 @@ class OverseerImpl implements AgentHooks {
             content = seeded;
             validateCodeChangeContent(change, content);
             content = applyCodeChange(content, change);
-            this.#appendChatChangeRow(chatId, fresh, author, change, newPins, content);
+            this.#appendChatChangeRow(chatId, fresh, author, change, newPins, content, undefined,
+              replica && step.replicaCommit ? {leaseId: step.replicaCommit.leaseId,
+                batchId: step.replicaCommit.receipt.batchId} : undefined);
           }
         }
 
@@ -2947,7 +2914,8 @@ class OverseerImpl implements AgentHooks {
           const fresh = this.storage.chatMeta.get(chatId)!;
           const cached = this.#chatContentCache.get(chatId);
           if (!cached) throw new Error("Replica acceptance requires materialized chat content.");
-          this.#appendChatChangeRow(chatId, fresh, author, {}, [], cached.content);
+          this.#appendChatChangeRow(chatId, fresh, author, {}, [], cached.content, undefined,
+            {leaseId: step.replicaCommit.leaseId, batchId: step.replicaCommit.receipt.batchId});
           step.replicaCommit.receipt.committedAt = this.replicaCursor(
               this.requireReplicaLease(step.replicaCommit.leaseId));
           this.storage.worktreeReplicaCommits.put(step.replicaCommit);
@@ -3785,6 +3753,9 @@ class OverseerImpl implements AgentHooks {
     let entryCodeBase = this.chatCodeBase(meta);
     let generationToken = entryCodeBase.generation;
     let revisionToken = entryCodeBase.revision;
+    // Preserve the actual transforms before the accept closes this epoch. Re-diffing its
+    // flattened Git tree would lose positional intent in repeated text.
+    const acceptedOverlay = this.#replicaOverlay(chatId);
 
     // Message statuses drive excluding reverted creations from coverage below. The map stays
     // valid through the whole accept: the sequence-token revalidation after the awaits
@@ -4187,6 +4158,18 @@ class OverseerImpl implements AgentHooks {
     for (let [worktreeId, newPinBase] of worktreeAccepts) {
       let record = this.storage.gadgets.get(worktreeId);
       if (record?.type === "worktree" && record.pinBase !== newPinBase) {
+        record.replicaBaseCommit ??= record.pinBase;
+        const prefix: CodeChange = {[worktreeId]: [...this.storage.worktreeBaseChanges
+          .byWorkpiece.get(worktreeId)].map(item => [item.path, item.change])};
+        const composed = composeCodeChange(prefix,
+          {[worktreeId]: acceptedOverlay[worktreeId] ?? []});
+        const previousPrefix = [...this.storage.worktreeBaseChanges.byWorkpiece.get(worktreeId)];
+        for (const item of previousPrefix) {
+          this.storage.worktreeBaseChanges.deleteRecord(item);
+        }
+        for (const [path, change] of composed[worktreeId] ?? []) {
+          this.storage.worktreeBaseChanges.put({workpieceId: worktreeId, path, change});
+        }
         record.pinBase = newPinBase;
         this.storage.gadgets.put(record);
       }
@@ -5452,10 +5435,13 @@ class OverseerImpl implements AgentHooks {
         content.state.workspacePath === undefined) {
       throw new Error("Chat attachment has no stored content.");
     }
-    let text = await this.readFileAtCommit(
+    const entry = await this.gitCache.pathEntryAtCommit(
         content.state.workspaceCommitId, content.state.workspacePath);
-    if (text === undefined) throw new Error("Chat attachment content is missing from Git.");
-    return new TextEncoder().encode(text);
+    if (!entry || entry.kind === "dir" || entry.kind === "submodule") {
+      throw new Error("Chat attachment content is missing from Git.");
+    }
+    return (await this.gitCache.ensureObject(entry.oid,
+      {type: "blob", referencedBy: entry.referencedBy})).payload;
   }
 
   // Prepare a stored chat message for delivery to a client: inline image attachment bytes
@@ -5521,8 +5507,13 @@ class OverseerImpl implements AgentHooks {
         throw new Error("Chat attachment is no longer available.");
       }
       let path = this.#attachmentWorkspaceFilename(attachment, used);
+      // The OT engine is UTF-16 text. Invalid UTF-8 stays an ordinary byte attachment,
+      // never a lossy replacement-character worktree. Keep a UTF-8 BOM as actual content.
+      let text: string;
+      try { text = new TextDecoder("utf-8", {fatal: true, ignoreBOM: true}).decode(content.data); }
+      catch { continue; }
       attachment.workspacePath = path;
-      files.set(path, new TextDecoder().decode(content.data));
+      files.set(path, text);
     }
     return files;
   }
@@ -5574,24 +5565,7 @@ class OverseerImpl implements AgentHooks {
       pinBase: prepared.commitId,
     };
 
-    let repository = [...this.storage.workspaceRepositories.list()]
-        .find(candidate => candidate.kind === "attachments");
-    if (repository === undefined) {
-      repository = {
-        id: this.#allocateRepositoryId(),
-        kind: "attachments",
-        title: "Attachments",
-        created: new Date(),
-      };
-      this.storage.workspaceRepositories.put(repository);
-    }
     this.storage.gadgets.put(record);
-    this.storage.workspaceCheckouts.put({
-      workpieceId: record.id,
-      repositoryId: repository.id,
-      mountName: `attachments-${chatId}`,
-      created: new Date(),
-    });
     context.attachments = {worktreeId: record.id, bindingName};
     if (context.bindings !== undefined) context.bindings[bindingName] = record.id;
     this.storage.chatContext.put(context);
@@ -6337,6 +6311,7 @@ class OverseerImpl implements AgentHooks {
   // includes worktrees created this step; the stored map is used after an approval suspends it.
   replicaSelection(chatId: number): WorktreeBase[] {
     let names = new Map<WorkpieceId, string>();
+    const context = this.getChatAgentContext(chatId);
     const active = this.#worktreeReplicaTurns.get(chatId);
     if (active) {
       for (const [name, entry] of active.bindings()) {
@@ -6366,16 +6341,14 @@ class OverseerImpl implements AgentHooks {
       const piece = this.storage.gadgets.get(id);
       if (!piece || (piece.type === "worktree" && piece.chatId !== chatId) ||
           (piece.type === "gadget" && piece.pending && piece.pending.chatId !== chatId)) return [];
-      const checkout = this.#checkoutMetadata(id);
-      const repository = this.storage.workspaceRepositories.get(checkout.repositoryId);
       const source = piece.type === "gadget" ? "gadget" as const :
-        repository?.kind === "attachments" ? "attachments" as const : "repository" as const;
-      return [{ checkoutId: id, binding, mountName: checkout.mountName,
+        context.attachments?.worktreeId === id ? "attachments" as const : "repository" as const;
+      return [{ checkoutId: id, binding,
         // Accepted auto-commits exist only in the DO. Git hydration must keep the original
         // source commit; accepted changes, like pending changes, belong in the replica overlay.
-        baseCommit: source === "repository" && piece.type === "worktree" ? piece.baseCommit :
+        baseCommit: piece.type === "worktree" ? piece.replicaBaseCommit ?? piece.pinBase :
           active?.access.getBaseCommit(id) ?? pins.get(id) ??
-          (piece.type === "worktree" ? piece.pinBase : piece.commitId) ?? null,
+          piece.commitId ?? null,
         baseTree: null, source }];
     });
   }
@@ -6395,8 +6368,11 @@ class OverseerImpl implements AgentHooks {
     }
     const leases = [...this.storage.worktreeReplicaLeases.list()];
     for (const lease of leases) {
+      const meta = this.storage.chatMeta.get(lease.chatId);
+      const epochChanged = lease.checkpoint && (!meta ||
+        Number(lease.checkpoint.cursor.split(":").at(-2)) !== this.chatCodeBase(meta).generation);
       if (lease.released || lease.expiresAt <= Date.now() ||
-          this.storage.agentIntegrationTurns.get(lease.chatId)?.turnId !== lease.turnId) {
+          this.storage.agentIntegrationTurns.get(lease.chatId)?.turnId !== lease.turnId || epochChanged) {
         const receipts = [...this.storage.worktreeReplicaCommits.byLease.get(lease.id)];
         for (const receipt of receipts) {
           this.storage.worktreeReplicaCommits.delete(receipt.id);
@@ -6407,8 +6383,6 @@ class OverseerImpl implements AgentHooks {
           lease.worktrees.every((tree, index) => tree.checkoutId === worktrees[index].checkoutId &&
             tree.baseCommit === worktrees[index].baseCommit)) {
         return this.ctx.exports.WorkspaceReplicaEndpoint({ props: { overseerId: this.ctx.id.toString(), leaseId: lease.id } });
-      } else {
-        throw new Error("A workspace replica lease is already active; release it before opening another.");
       }
     }
     const lease: WorktreeReplicaLease = { id: crypto.randomUUID(), gatekeeperId, chatId: origin.chatId,
@@ -6422,6 +6396,11 @@ class OverseerImpl implements AgentHooks {
     const turn = lease && this.storage.agentIntegrationTurns.get(lease.chatId);
     if (!lease || lease.released || lease.expiresAt <= Date.now() || turn?.turnId !== lease.turnId ||
         !this.integrationGrant(lease.gatekeeperId).worktreeReplica) throw new Error("Replica lease expired or revoked.");
+    const meta = this.storage.chatMeta.get(lease.chatId);
+    if (!meta || lease.checkpoint &&
+        Number(lease.checkpoint.cursor.split(":").at(-2)) !== this.chatCodeBase(meta).generation) {
+      throw new Error("Replica epoch changed; acquire a new lease and checkpoint.");
+    }
     const current = this.replicaSelection(lease.chatId);
     for (const tree of lease.worktrees) {
       if (!current.some(item => item.checkoutId === tree.checkoutId && item.baseCommit === tree.baseCommit)) {
@@ -6449,6 +6428,16 @@ class OverseerImpl implements AgentHooks {
 
   #replicaEntries = new Map<string, Promise<WorktreeBaseEntry[]>>();
 
+  #replicaOverlay(chatId: number): CodeChange {
+    const history = this.loadChatHistory(chatId);
+    let result = foldCompactedCode(history.chatMessages, Infinity, history.checkpoint).proposedChange ?? {};
+    const meta = this.storage.chatMeta.get(chatId)!;
+    for (const row of this.listLiveChatChanges(chatId, this.chatCodeBase(meta).generation)) {
+      result = composeCodeChange(result, row.change);
+    }
+    return result;
+  }
+
   getWorkspaceReplicaSession(id: string): WorktreeReplicaSession {
     // Minting reveals no data. Each method and cursor page checks the lease before use;
     // doing it here too makes a failed pipelined lookup leak a second rejected RPC promise.
@@ -6457,14 +6446,6 @@ class OverseerImpl implements AgentHooks {
       const tree = lease.worktrees.find(tree => tree.checkoutId === checkoutId);
       if (!tree) throw new Error("Checkout is outside the replica grant.");
       return tree;
-    };
-    // The content base can advance at an accept without moving the immutable hydration base.
-    const contentBase = (lease: WorktreeReplicaLease, checkoutId: number) => {
-      const piece = this.storage.gadgets.get(checkoutId);
-      const meta = this.storage.chatMeta.get(lease.chatId)!;
-      return this.#worktreeReplicaTurns.get(lease.chatId)?.access.getBaseCommit(checkoutId) ??
-        this.chatCodeBase(meta).pins.find(pin => pin.gadgetId === checkoutId)?.baseCommit ??
-        (piece?.type === "worktree" ? piece.pinBase : piece?.commitId);
     };
     const entries: WorktreeReplicaHost["entries"] = async (lease, checkoutId) => {
       const tree = requireTree(lease, checkoutId);
@@ -6495,15 +6476,6 @@ class OverseerImpl implements AgentHooks {
       if (!entry || entry.kind === "dir" || entry.kind === "submodule") throw new Error("No readable base file at this path.");
       return (await this.gitCache.ensureObject(entry.oid, { type: "blob", referencedBy: entry.referencedBy })).payload;
     };
-    const overlay = (lease: WorktreeReplicaLease): CodeChange => {
-      const history = this.loadChatHistory(lease.chatId);
-      let result = foldCompactedCode(history.chatMessages, Infinity, history.checkpoint).proposedChange ?? {};
-      const meta = this.storage.chatMeta.get(lease.chatId)!;
-      for (const row of this.listLiveChatChanges(lease.chatId, this.chatCodeBase(meta).generation)) {
-        result = composeCodeChange(result, row.change);
-      }
-      return result;
-    };
     const host: WorktreeReplicaHost = {
       requireLease: id => this.requireReplicaLease(id), saveLease: lease => this.storage.worktreeReplicaLeases.put(lease),
       entries, baseFile,
@@ -6530,33 +6502,26 @@ class OverseerImpl implements AgentHooks {
           throw new Error("Workspace changed during checkpoint capture; retry.");
         }
         const cursor = this.replicaCursor(lease);
-        const content = await this.getCurrentChatContent(lease.chatId, this.storage.chatMeta.get(lease.chatId)!);
-        const pending = overlay(lease);
+        const pending = this.#replicaOverlay(lease.chatId);
         if (this.replicaCursor(lease) !== cursor) throw new Error("Workspace changed during checkpoint capture; retry.");
         const changes: WorktreeChange[] = [];
+        let overlayBytes = 0;
         for (const tree of lease.worktrees) {
           const root = tree.baseCommit && await this.gitCache.pathEntryAtCommit(tree.baseCommit, "");
           tree.baseTree = root ? root.oid : null;
-          const pendingPaths = new Map(pending[tree.checkoutId] ?? []);
-          const paths = new Set(pendingPaths.keys());
-          const base = contentBase(lease, tree.checkoutId);
-          if (tree.baseCommit && base && tree.baseCommit !== base) {
-            // Compare tree metadata only: untouched repository blobs stay lazy in the DO.
-            for (const path of await this.gitCache.changedFilePathsBetween(tree.baseCommit, base)) {
-              paths.add(path);
-            }
-          }
-          for (const path of paths) {
+          const prefix: CodeChange = {[tree.checkoutId]: [...this.storage.worktreeBaseChanges
+            .byWorkpiece.get(tree.checkoutId)].map(item => [item.path, item.change])};
+          const composed = composeCodeChange(prefix,
+            {[tree.checkoutId]: pending[tree.checkoutId] ?? []});
+          // Bound the stored transforms, not their resulting full files or a JSON copy.
+          overlayBytes += codeChangeSerializedSize(composed) + 256 * (composed[tree.checkoutId]?.length ?? 0);
+          if (overlayBytes > 1024 * 1024) throw new Error("Replica checkpoint transforms exceed their storage budget.");
+          for (const [path, change] of composed[tree.checkoutId] ?? []) {
             requireReplicaPath(path);
-            const change = pendingPaths.get(path);
-            const text = change && "remove" in change ? undefined : content.get(tree.checkoutId)?.get(path) ??
-              (base ? await this.readFileAtCommit(base, path) : undefined);
-            changes.push({ checkoutId: tree.checkoutId, path,
-              change: text === undefined ? { remove: true } : { set: text } });
+            changes.push({checkoutId: tree.checkoutId, path, change});
           }
         }
         if (this.replicaCursor(lease) !== cursor) throw new Error("Workspace changed during checkpoint capture; retry.");
-        if (JSON.stringify(changes).length > 1024 * 1024) throw new Error("Replica checkpoint overlay exceeds its budget.");
         const refreshed = this.requireReplicaLease(lease.id);
         this.storage.worktreeReplicaLeases.put({ ...refreshed, worktrees: lease.worktrees });
         return { cursor, overlay: changes };
@@ -6571,27 +6536,19 @@ class OverseerImpl implements AgentHooks {
             Number(match[2]) < checkpointRevision || Number(match[2]) > base.revision) throw new Error("Replica cursor expired.");
         const after = Number(match[2]), through = Math.min(base.revision, after + limit);
         const rows = this.listChatChangesSince(lease.chatId, base.generation, after, through);
-        if (!rows) throw new Error("Replica cursor history expired; open a new checkpoint.");
-        const receipts = [...this.storage.worktreeReplicaCommits.byLease.get(lease.id)];
+        if (!rows) throw new Error("Replica cursor history expired; acquire a new lease and checkpoint.");
         const events = rows.map(row => {
           const cursor = `${lease.id}:${row.generation}:${row.revision}`;
-          const receipt = receipts.find(item => item.receipt.committedAt === cursor);
-          return { cursor, ...(receipt ? { sourceBatchId: receipt.receipt.batchId } : {}),
+          return { cursor, ...(row.sourceReplica?.leaseId === lease.id
+            ? {sourceBatchId: row.sourceReplica.batchId} : {}),
             changes: lease.worktrees.flatMap(tree => (row.change[tree.checkoutId] ?? []).map(([path, change]) =>
               ({ checkoutId: tree.checkoutId, path, change }))) };
         });
         return { events, cursor: events.at(-1)?.cursor ?? cursor, hasMore: through < base.revision };
       },
-      readCanonical: async (lease, checkoutId, path) => {
-        requireTree(lease, checkoutId);
+      flush: async lease => {
         const active = this.#worktreeReplicaTurns.get(lease.chatId)?.access;
-        if (active) return active.getRemovedPaths(checkoutId).has(path) ? undefined : active.readFile(checkoutId, path);
-        const changes = overlay(lease)[checkoutId];
-        if (changes?.some(([name, change]) => name === path && "remove" in change)) return undefined;
-        const content = await this.getCurrentChatContent(lease.chatId, this.storage.chatMeta.get(lease.chatId)!);
-        if (content.get(checkoutId)?.has(path)) return content.get(checkoutId)!.get(path);
-        const base = contentBase(lease, checkoutId);
-        return base ? this.readFileAtCommit(base, path) : undefined;
+        return active?.flushReplica ? active.flushReplica({}, active.getRevision?.() ?? 0) : true;
       },
       version: lease => this.replicaVersion(lease), getCommit: id => this.storage.worktreeReplicaCommits.get(id),
       commit: async (lease, version, change, receipt) => {
@@ -6601,7 +6558,7 @@ class OverseerImpl implements AgentHooks {
         try {
           if (active?.access.flushReplica) return await active.access.flushReplica(change, active.access.getRevision?.() ?? 0, receipt);
           return await this.commitAgentStep(lease.chatId, { type: "agent", id: lease.gatekeeperId.toString(), name: "Worktree replica" }, [], {
-            changes: Object.keys(change).length ? [{ change }] : [], createdGadgets: [], createdWorktrees: [],
+            changes: Object.keys(change).length ? [{change, replica: true}] : [], createdGadgets: [], createdWorktrees: [],
             addedBindings: [], worktreeCommits: [], blueprintMerges: [], replicaCommit: receipt, replicaExpectedVersion: version });
         } catch (error) { if (error instanceof ReplicaChangedError) return false; throw error; }
       },
@@ -6730,7 +6687,8 @@ class OverseerImpl implements AgentHooks {
   async beginAgentIntegrationTurn(chatId: number): Promise<void> {
     if (!this.env.AGENT_INTEGRATION_GRANTS) return;
     const request = [...this.storage.chats.list({ prefix: `${keyString(chatId)}.`, reverse: true })]
-      .find(message => message.type === "message" && message.author.type !== "agent");
+      .find(message => message.type === "agentCallback" ||
+        message.type === "message" && message.author.type !== "agent");
     const requestKey = String(request?.sequence ?? this.nextChatSequencePeek(chatId));
     let previous = this.storage.agentIntegrationTurns.get(chatId);
     if (previous && previous.state !== "finished" && previous.requestKey !== requestKey) {
@@ -13927,7 +13885,7 @@ class ApprovalQueueImpl extends RpcTarget implements ApprovalQueue {
     super();
     if (caller.from === "agent") {
       const grant = impl.integrationGrant(gatekeeperId);
-      this.#integrationOrigin = grant.lifecycle || grant.contextualActions
+      this.#integrationOrigin = grant.lifecycle || grant.contextualActions || grant.worktreeReplica
         ? impl.captureIntegrationOrigin(caller) : undefined;
     }
   }

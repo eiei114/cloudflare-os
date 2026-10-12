@@ -26,7 +26,7 @@ import {
   type BlueprintOutput, type ChatGadgetPinRecord, type CollaboratorRole, type GadgetUpstream,
   type GatekeeperCreationSpec, type PermissionEdge, type WorkpieceId,
 } from "@gadgets/workshop-shared/api";
-import type { CodeChange } from "@gadgets/workshop-shared/code-change";
+import type { CodeChange, FileChange } from "@gadgets/workshop-shared/code-change";
 import type { ChatGatewayRpcTarget } from "@gadgets/workshop-shared/external-message-gateway";
 import type {
   ActionDescription, ActionKind, Gatekeeper, GitObjectType, GitOid, HookController,
@@ -325,6 +325,9 @@ export type WorktreeRecord = {
    */
   pinBase: string;
 
+  /** Immutable hydration anchor for the composed accepted OT prefix; absent until first accept. */
+  replicaBaseCommit?: string;
+
   /**
    * Never set: a worktree has no workspace-level binding name -- the name it was created under
    * lives only in its chat's binding map, so two chats can each have a worktree named `REPO`.
@@ -355,25 +358,11 @@ export type WorktreeRecord = {
  */
 export type WorkpieceRecord = GadgetRecord | WorktreeRecord;
 
-/** One logical repository whose objects share the workspace's content-addressed Git store. */
-export type WorkspaceRepositoryRecord = {
-  id: number;
-  kind: "gadget" | "external" | "attachments";
-  title: string;
-  created: Date;
-  /** Capability that supplied the original commit, when the repository came from a connection. */
-  sourceGatekeeperId?: WorkpieceId;
-  /** Denormalized durable identity/display fallback if that capability is later disconnected. */
-  resourceUrl?: string;
-};
-
-/** The stable on-disk identity of one workpiece checkout. */
-export type WorkspaceCheckoutRecord = {
+/** Accepted transforms from a worktree's immutable hydration anchor to its current pinBase. */
+export type WorktreeBaseChangeRecord = {
   workpieceId: WorkpieceId;
-  repositoryId: number;
-  /** Collision-free directory directly below `/workspace`. */
-  mountName: string;
-  created: Date;
+  path: string;
+  change: FileChange;
 };
 
 // =======================================================================================
@@ -948,6 +937,9 @@ export type ChatChangeRecord = {
   /** The submission echo for user rows (see AiChatSubscriber.changeApplied); absent otherwise. */
   submission?: {clientId: string, seq: number};
 
+  /** Provenance of this row, not of other edits flushed in the same agent step. */
+  sourceReplica?: {leaseId: string, batchId: string};
+
   /**
    * Set when the row is no longer live: a "changes" message has materialized it (its change is part
    * of the message), or its generation was closed by a merge's epoch reset. Retired rows are
@@ -1234,7 +1226,7 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       //       where the chat log still told: those an agent created from a blueprint name it,
       //       and those created from scratch name none. Every gadget created from here on has
       //       an `upstream` once it is permanent.
-      //   6 = durable integration/replica journals and lazy repository/check-out identities.
+      //   6 = durable integration/replica journals and accepted worktree OT prefixes.
       version: 0,
 
       // The workspace title. (Each chat, gatekeeper, and gadget has its own title, elsewhere.)
@@ -1277,8 +1269,6 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       nextChatId: 0,
       nextHookId: 0,
       nextAgentCallId: 0,
-      // Independent repository identities: multiple checkouts may share one logical repository.
-      nextRepositoryId: 0,
 
       // OBSOLETE: deadWorktreeIds existed to facilitate hiding worktrees from clients, but we
       // no longer do that. Noted here since old workspaces may still have a singleton by this
@@ -1303,13 +1293,9 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
     },
 
     collections: {
-      workspaceRepositories: collection<WorkspaceRepositoryRecord>()({
-        primaryKey: "id",
-        nonUniqueIndexes: {bySourceGatekeeper: (record: WorkspaceRepositoryRecord) => record.sourceGatekeeperId ?? null},
-      }),
-      workspaceCheckouts: collection<WorkspaceCheckoutRecord>()({
-        primaryKey: "workpieceId",
-        uniqueIndexes: {byMountName: (record: WorkspaceCheckoutRecord) => record.mountName},
+      worktreeBaseChanges: collection<WorktreeBaseChangeRecord>()({
+        primaryKey: record => `${keyString(record.workpieceId)}.${record.path}`,
+        nonUniqueIndexes: {byWorkpiece: (record: WorktreeBaseChangeRecord) => record.workpieceId},
       }),
       pausedAgents: collection<ActiveAgentRecord>()({primaryKey: "chatId"}),
       actionApplications: collection<ActionApplication>()({

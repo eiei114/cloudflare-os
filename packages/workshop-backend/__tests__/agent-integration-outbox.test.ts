@@ -92,6 +92,40 @@ describe("agent integration over persistent native RPC", () => {
     expect([...impl.storage.agentIntegrationParticipants.list()]).toEqual([]);
   }));
 
+  it("supplies context for a replica-only grant without granting lifecycle participation", async () => inKernel(async (impl, participant) => {
+    const handler = actionFacet(impl);
+    impl.env.AGENT_INTEGRATION_GRANTS = '{"container":{"worktreeReplica":true}}';
+    try {
+      await impl.beginAgentIntegrationTurn(CHAT);
+      using session = await impl.openGatekeeperSession(GATEKEEPER, handler.facet, {from: "agent", chatId: CHAT});
+      expect(session.turn?.turnId).toBe(origin(impl).turnId);
+      await expect(impl.registerIntegrationParticipant(GATEKEEPER, origin(impl), "running", participant))
+        .rejects.toThrow(/not been granted/);
+    } finally { handler.restore(); }
+  }));
+
+  it("starts a new turn for an independent callback, but resumes approval nudges", async () => inKernel(async (impl, participant) => {
+    const timestamp = impl.getChatTimestamp();
+    impl.storage.chatMeta.put({id: CHAT, title: "Callbacks", started: timestamp, lastActive: timestamp});
+    impl.addChatMessages(CHAT, APPROVER, [{type: "message", message: "first request"}]);
+    await impl.beginAgentIntegrationTurn(CHAT);
+    const first = origin(impl);
+    const oldContext = impl.getIntegrationContext(GATEKEEPER, first)!;
+    await impl.registerIntegrationParticipant(GATEKEEPER, first, "running", participant);
+    await impl.closeAgentIntegrationTurn(CHAT, "approval");
+    impl.addChatMessages(CHAT, {type: "agent", id: "agent", name: "Agent"}, [{type: "agentNudge", text: "approval ready"}]);
+    await impl.beginAgentIntegrationTurn(CHAT);
+    expect(origin(impl).turnId).toBe(first.turnId);
+    await impl.closeAgentIntegrationTurn(CHAT, "approval");
+    impl.addChatMessages(CHAT, {type: "gadget", id: "gadget", name: "Gadget"}, [
+      {type: "agentCallback", callId: 0, methodName: "newRequest", argsSummary: "independent callback"},
+    ]);
+    await impl.beginAgentIntegrationTurn(CHAT);
+    expect(origin(impl).turnId).not.toBe(first.turnId);
+    expect((await participant.calls()).at(-1)?.event).toMatchObject({kind: "finished", reason: "abandoned"});
+    await expect(oldContext.getTurn()).rejects.toThrow(/expired/);
+  }));
+
   it("persists failed delivery and retries the same event id before advancing a segment", async () => inKernel(async (impl, participant) => {
     await impl.beginAgentIntegrationTurn(CHAT);
     await participant.setFailure(true);

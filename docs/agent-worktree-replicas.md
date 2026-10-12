@@ -3,7 +3,10 @@
 The kernel remains authoritative for worktrees and their existing `FileChange` transforms.
 An integration may keep a fully materialized replica, but never takes ownership of ordinary
 agent file operations. Linux runners, images, filesystem implementations, network policy and
-snapshots belong to the integration, not to `workshop-backend`.
+snapshots, mount names and single-container policy belong to the integration, not to
+`workshop-backend`. Filesystem-to-OT calculation also belongs to the integration. The kernel
+only validates scoped anchors and orders submitted transforms using the existing OT engine;
+it must never re-diff canonical contents to approximate the journal's operations.
 
 ## Authority and lifecycle
 
@@ -27,9 +30,9 @@ executing under a new user prompt.
 ## Bootstrap and synchronization
 
 1. Acquire a revocable, expiring lease for the captured worktree selection.
-2. Capture a checkpoint containing mount/provenance metadata, immutable base identities,
-   pending transforms, and an exact canonical cursor. Repository, gadget and attachment
-   worktrees have collision-free mounts; attachments are ordinary indexed worktree content.
+2. Capture a checkpoint containing binding/source metadata, immutable base identities,
+   composed transforms, and an exact canonical cursor. The integration chooses collision-free
+   paths for repository, gadget and attachment worktrees and retains those paths in snapshots.
 3. Enumerate and stream base bytes separately from the transform overlay. No whole-repository
    content buffer or base64 transfer is introduced. A provider may alternatively serve a
    validated native Git v2 pack for the already-advertised exact base commit. GitHub and GitLab
@@ -45,7 +48,18 @@ executing under a new user prompt.
    atomically stores a payload-bound batch receipt. Identical retries return the same receipt;
    reusing an ID for different content fails. Corrections bring the replica to canonical content.
 6. Renew within the original grant/turn bounds; release fences further writes without removing
-   already accepted changes. Expired cursors require a new checkpoint, not an empty success.
+   already accepted changes. Live leases retain their required journal rows beyond the ordinary
+   retired-row TTL, so caught-up clients can reconstruct anchors after long commands or DO resets.
+   Expiry/revocation or an epoch change requires reacquiring a lease and checkpoint, not replaying
+   an empty successful page. A checkpoint is immutable for its lease.
+
+Journal events tag each replica-owned OT row with its batch, including an empty acceptance marker
+for no-op batches. Ordinary DO edits flushed at the same barrier are not tagged. Echo batch IDs
+are lease-local: another replica never mistakes a coincidentally equal batch ID for its own write.
+
+UTF-8 text attachments become ordinary worktree files; BOMs are preserved as content, and downloads
+read the original Git blob bytes. Rev 0 leaves non-UTF-8 attachments in the byte-preserving attachment
+store rather than silently substituting replacement characters into a text worktree.
 
 The bootstrap API preserves Git modes and binary base bytes. Rev 0 mutation submission is text
 only; it does not promise arbitrary binary/mode/Gitlink mutation support. A client cannot push
@@ -65,11 +79,20 @@ independent sinks: they do not import a private integration package.
 
 ## Storage and porting
 
-Integration journals, leases, receipts, repository identities, and attachment references live in
+Integration journals, leases, receipts, accepted OT prefixes, and attachment references live in
 `storage-schema/overseer-storage.ts`. Schema version 6 adds their empty collections without
-eagerly fetching repository contents; existing repository identities are allocated on first use.
-Replica overlays use the same compacted-history fold as agent replay, followed by live OT rows,
-so bootstrap retains edits across chat compaction.
+eagerly fetching repository contents. Checkout IDs are existing workpiece IDs; source provenance
+remains in worktree records and the OID store, without a separate filesystem/repository catalog.
+Replica overlays use the same compacted-history fold as agent replay, followed by live OT rows.
+At accept, the original operations compose into a per-path durable prefix relative to a stable
+hydration commit. Bootstrap therefore retains positional intent and small deltas across accepts,
+compaction and eviction without loading untouched file contents or expanding edits to full-file sets.
+Pre-prototype worktrees without that prefix start from their current accepted commit; if it is
+local-only, the integration uses binary base streaming rather than fetching it from a provider.
+
+Retention is deliberately lease-bounded, not a longer global TTL: a long live lease retains more
+journal rows on disk, and ordinary lazy pruning resumes after it ends. Advancing compact per-client
+anchors to reduce that retention is a future optimization, not another merge algorithm.
 
 Bootstrap adapters validate the immutable commit before contacting upstream and return the
 binary response stream directly. Native Git tests belong in gatekeeper-kit; provider workerd

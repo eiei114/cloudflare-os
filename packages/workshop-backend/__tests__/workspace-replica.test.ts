@@ -1,12 +1,13 @@
 import {describe, expect, it} from "vitest";
-import {applyCodeChange} from "@gadgets/workshop-shared/code-change";
+import {applyCodeChange, diffFiles} from "@gadgets/workshop-shared/code-change";
 import {mergeReplicaBatch} from "../src/workspace-replica";
 import {workspaceCollisionCases} from "./workspace-collision-cases";
 
 async function merge(before: string | null, local: string | null, remote: string | undefined) {
   return mergeReplicaBatch(7, {
-    batchId: "batch", files: [{path: "a.txt", before, after: local}],
-  }, async () => remote);
+    batchId: "batch", files: [{path: "a.txt", before,
+      change: diffFiles(content(before), content(local))[7]?.[0]?.[1] ?? null}],
+  }, diffFiles(content(before), content(remote ?? null)));
 }
 
 function content(text: string | null) {
@@ -35,6 +36,14 @@ describe("DO-authoritative replica reconciliation", () => {
         .get(7)?.get("a.txt")).toBe("ONE\nTWO\n");
     expect(applyCodeChange(new Map([[7, new Map([["a.txt", "ONE\ntwo\n"]])]]),
         {7: ack.changes}).get(7)?.get("a.txt")).toBe("ONE\nTWO\n");
+  });
+
+  it("preserves canonical insertion positions in repeated text instead of re-diffing", async () => {
+    const {change, ack} = await mergeReplicaBatch(7, {batchId: "position", files: [
+      {path: "a.txt", before: "aaa", change: {edit: [[0, "X"], 3]}},
+    ]}, {7: [["a.txt", {edit: [[0, "a"], 3]}]]});
+    expect(applyCodeChange(content("aaaa"), change).get(7)?.get("a.txt")).toBe("aXaaa");
+    expect(applyCodeChange(content("Xaaa"), {7: ack.changes}).get(7)?.get("a.txt")).toBe("aXaaa");
   });
 
   it("does not echo DO-only edits back into the canonical stream", async () => {
@@ -72,13 +81,13 @@ describe("DO-authoritative replica reconciliation", () => {
 
   it("rejects duplicate and private paths before accepting mutations", async () => {
     await expect(mergeReplicaBatch(7, {batchId: "bad", files: [
-      {path: "a", before: null, after: "x"}, {path: "a", before: null, after: "y"},
-    ]}, async () => undefined)).rejects.toThrow("Duplicate");
+      {path: "a", before: null, change: {set: "x"}}, {path: "a", before: null, change: {set: "y"}},
+    ]}, {})).rejects.toThrow("Duplicate");
     await expect(mergeReplicaBatch(7, {batchId: "bad", files: [
-      {path: "../escape", before: null, after: "x"},
-    ]}, async () => undefined)).rejects.toThrow();
+      {path: "../escape", before: null, change: {set: "x"}},
+    ]}, {})).rejects.toThrow();
     await expect(mergeReplicaBatch(7, {batchId: "bad", files: [
-      {path: ".git/config", before: null, after: "x"},
-    ]}, async () => undefined)).rejects.toThrow();
+      {path: ".git/config", before: null, change: {set: "x"}},
+    ]}, {})).rejects.toThrow();
   });
 });

@@ -80,14 +80,16 @@ describe("kernel replica capability over native RPC", () => {
         ]));
         expect(await cursor.next()).toBeNull();
         const receipt = await replica.submitBatch({batchId: "after-accept", baseCursor: checkpoint.cursor, files: [
-          {checkoutId: tree.id, path: "a.txt", before: expected, after: expected + "container\n"},
-          {checkoutId: tree.id, path: "new.txt", before: "accepted new\n", after: "container new\n"},
-          {checkoutId: tree.id, path: "gone.txt", before: null, after: "recreated\n"},
+          {checkoutId: tree.id, path: "a.txt", baseHash: await replicaTextHash(expected),
+            change: {edit: [expected.length, [0, "container", ""]]}},
+          {checkoutId: tree.id, path: "new.txt", baseHash: await replicaTextHash("accepted new\n"),
+            change: {set: "container new\n"}},
+          {checkoutId: tree.id, path: "gone.txt", baseHash: null, change: {set: "recreated\n"}},
         ]});
         expect(receipt.accepted).toEqual([
-          {checkoutId: tree.id, path: "a.txt", content: expected + "container\n"},
-          {checkoutId: tree.id, path: "new.txt", content: "container new\n"},
-          {checkoutId: tree.id, path: "gone.txt", content: "recreated\n"},
+          {checkoutId: tree.id, path: "a.txt", hash: await replicaTextHash(expected + "container\n")},
+          {checkoutId: tree.id, path: "new.txt", hash: await replicaTextHash("container new\n")},
+          {checkoutId: tree.id, path: "gone.txt", hash: await replicaTextHash("recreated\n")},
         ]);
         // Capturing and reconciling never materializes unrelated base blobs in the chat map.
         const content = await impl.getCurrentChatContent(1, impl.storage.chatMeta.get(1)!);
@@ -144,7 +146,7 @@ describe("kernel replica capability over native RPC", () => {
 
 function fixture(before: string | null = "one\ntwo\n") {
   let lease: WorktreeReplicaLease = { id: "lease", gatekeeperId: 1, chatId: 2, turnId: "turn",
-    expiresAt: Date.now() + 60_000, worktrees: [{ checkoutId: 7, binding: "REPO", mountName: "repo-7",
+    expiresAt: Date.now() + 60_000, worktrees: [{ checkoutId: 7, binding: "REPO",
       baseCommit: "commit", baseTree: "tree", source: "repository" }] };
   const initial = new Map<string, string>(before === null ? [] : [["a.txt", before]]);
   let content: CodeContent = new Map([[7, new Map(initial)]]);
@@ -177,7 +179,7 @@ function fixture(before: string | null = "one\ntwo\n") {
       const page = events.slice(start, start + limit);
       return { events: page, cursor: page.at(-1)?.cursor ?? from, hasMore: start + page.length < events.length };
     },
-    readCanonical: async (_lease, id, path) => content.get(id)?.get(path),
+    flush: async () => true,
     version: cursor, getCommit: id => commits.get(id),
     commit: async (_lease, expected, change, commit) => {
       requireLive();
@@ -191,6 +193,7 @@ function fixture(before: string | null = "one\ntwo\n") {
   };
   return { session: new WorktreeReplicaSession(host, "lease"), host, commits, events,
     get content() { return content; },
+    remoteChange(change: CodeChange) { append(change); },
     remote(text: string | null) {
       append(diffFiles(content, new Map([[7, new Map(text === null ? [] : [["a.txt", text]])]])));
     },
@@ -200,8 +203,8 @@ function fixture(before: string | null = "one\ntwo\n") {
   };
 }
 
-function batch(before = "one\ntwo\n", after = "ONE\ntwo\n"): WorktreeReplicaBatch {
-  return { batchId: "batch", baseCursor: "cursor-0", files: [{ checkoutId: 7, path: "a.txt", before, after }] };
+async function batch(before: string | null = "one\ntwo\n", after: string | null = "ONE\ntwo\n"): Promise<WorktreeReplicaBatch> {
+  return {...await compactBatch(before, after), batchId: "batch"};
 }
 async function compactBatch(before: string | null, after: string | null): Promise<WorktreeReplicaBatch> {
   const code = (text: string | null): CodeContent => new Map([[7, new Map(text === null ? [] : [["a.txt", text]])]]);
@@ -229,6 +232,16 @@ describe("scoped native worktree replica protocol", () => {
     expect(JSON.stringify(input).length).toBeLessThan(1000);
     expect(JSON.stringify(receipt).length).toBeLessThan(1000);
     expect(f.content.get(7)?.get("a.txt")).toBe("y" + before.slice(1, -1) + "z");
+  });
+  it("replays the actual canonical operations when equal bytes admit a different diff", async () => {
+    const f = fixture("aaa"); await f.session.checkpoint();
+    f.remoteChange({7: [["a.txt", {edit: [[0, "a"], 3]}]]});
+    const receipt = await f.session.submitBatch({batchId: "position", baseCursor: "cursor-0", files: [
+      {checkoutId: 7, path: "a.txt", baseHash: await replicaTextHash("aaa"),
+        change: {edit: [[0, "X"], 3]}},
+    ]});
+    expect(f.content.get(7)?.get("a.txt")).toBe("aXaaa");
+    expect(receipt.accepted[0].hash).toBe(await replicaTextHash("aXaaa"));
   });
   it("rejects forged compact anchors and invalid transforms without committing", async () => {
     const f = fixture(); await f.session.checkpoint();
@@ -265,7 +278,7 @@ describe("scoped native worktree replica protocol", () => {
     await expect(f.session.readGitPack(checkpoint.checkpointId, 7, new Uint8Array(65537))).rejects.toThrow();
     await f.session.closeGitBootstrap(checkpoint.checkpointId);
     await expect(f.session.readGitPack(checkpoint.checkpointId, 7, bytes)).rejects.toThrow(/closed|revoked/);
-    await f.session.submitBatch(batch());
+    await f.session.submitBatch(await batch());
     expect(calls).toBe(1);
   });
 
@@ -296,9 +309,8 @@ describe("scoped native worktree replica protocol", () => {
     const f = fixture(collision.before);
     await f.session.checkpoint();
     f.remote(collision.doText);
-    const receipt = await f.session.submitBatch({ ...batch(), files: [{ checkoutId: 7, path: "a.txt",
-      before: collision.before, after: collision.shellText }] });
-    expect(receipt.accepted[0]).toMatchObject({content: collision.expected});
+    const receipt = await f.session.submitBatch(await batch(collision.before, collision.shellText));
+    expect(receipt.accepted[0]).toMatchObject({hash: await replicaTextHash(collision.expected)});
     expect(f.content.get(7)?.get("a.txt") ?? null).toBe(collision.expected);
     expect(f.commits.get("lease:batch")?.receipt).toEqual(receipt);
     // A receipt does not skip unrelated canonical events preceding the acceptance.
@@ -309,16 +321,17 @@ describe("scoped native worktree replica protocol", () => {
   });
   it("binds an idempotency key to its exact payload and commits only once", async () => {
     const f = fixture(); await f.session.checkpoint();
-    const receipt = await f.session.submitBatch(batch());
-    expect(await f.session.submitBatch(batch())).toEqual(receipt);
+    const receipt = await f.session.submitBatch(await batch());
+    expect(await f.session.submitBatch(await batch())).toEqual(receipt);
     expect(f.commits.size).toBe(1); expect(f.events).toHaveLength(1);
-    await expect(f.session.submitBatch(batch("one\ntwo\n", "other"))).rejects.toThrow(/different payload/);
+    await expect(f.session.submitBatch(await batch("one\ntwo\n", "other"))).rejects.toThrow(/different payload/);
   });
   it("rejects forged anchors and duplicate paths without durable effects", async () => {
     const f = fixture(); await f.session.checkpoint();
-    await expect(f.session.submitBatch(batch("forged"))).rejects.toThrow(/anchor/);
-    await expect(f.session.submitBatch({ ...batch(), files: [batch().files[0], batch().files[0]] })).rejects.toThrow(/Duplicate/);
-    await expect(f.session.submitBatch({ ...batch(), files: [{ ...batch().files[0], checkoutId: 99 }] })).rejects.toThrow(/ungranted/);
+    await expect(f.session.submitBatch(await batch("forged"))).rejects.toThrow(/anchor/);
+    const input = await batch();
+    await expect(f.session.submitBatch({...input, files: [input.files[0], input.files[0]]})).rejects.toThrow(/Duplicate/);
+    await expect(f.session.submitBatch({...input, files: [{...input.files[0], checkoutId: 99}]})).rejects.toThrow(/ungranted/);
     expect(f.commits.size).toBe(0); expect(f.events).toEqual([]);
   });
   it("checks revocation after an awaited source read and on an already returned cursor", async () => {
@@ -333,31 +346,32 @@ describe("scoped native worktree replica protocol", () => {
     const f = fixture(); await f.session.checkpoint();
     f.failCommits(2);
     f.onRead(() => f.remote("one\nTWO\n"));
-    const receipt = await f.session.submitBatch(batch());
-    expect(receipt.accepted[0]).toMatchObject({content: "ONE\nTWO\n"});
+    const receipt = await f.session.submitBatch(await batch());
+    expect(receipt.accepted[0]).toMatchObject({hash: await replicaTextHash("ONE\nTWO\n")});
     expect(f.commits.size).toBe(1);
   });
   it("requires a reachable consumed cursor, not a receipt marker or client timestamp", async () => {
     const f = fixture(); await f.session.checkpoint();
-    await expect(f.session.submitBatch({ ...batch(), baseCursor: "future" })).rejects.toThrow(/cursor/);
+    await expect(f.session.submitBatch({...await batch(), baseCursor: "future"})).rejects.toThrow(/cursor/);
     f.remote("one\nTWO\n");
-    await expect(f.session.submitBatch({ ...batch(), baseCursor: "cursor-1" })).rejects.toThrow(/anchor/);
-    await expect(f.session.submitBatch({ ...batch(), baseCursor: "cursor-1", files: [{ checkoutId: 7,
-      path: "a.txt", before: "one\nTWO\n", after: "ONE\nTWO\n" }] })).resolves.toBeDefined();
+    await expect(f.session.submitBatch({...await batch(), baseCursor: "cursor-1"})).rejects.toThrow(/anchor/);
+    await expect(f.session.submitBatch({...await batch("one\nTWO\n", "ONE\nTWO\n"), baseCursor: "cursor-1"})).resolves.toBeDefined();
   });
   it.each(["../private", ".git/config", "a//b", "a/./b", "a\\b"])("rejects filesystem alias %s", async path => {
     const f = fixture(); await f.session.checkpoint();
-    await expect(f.session.submitBatch({ ...batch(), files: [{ checkoutId: 7, path, before: null, after: "x" }] })).rejects.toThrow(/path/);
+    await expect(f.session.submitBatch({...await batch(null, "x"), files: [
+      {...(await batch(null, "x")).files[0], path}]})).rejects.toThrow(/path/);
   });
   it("preserves UTF-8 BOMs rather than silently stripping immutable bytes", async () => {
     const f = fixture("\ufefftext"); await f.session.checkpoint();
-    expect((await f.session.submitBatch(batch("\ufefftext", "\ufeffedited"))).accepted[0]).toMatchObject({content: "\ufeffedited"});
+    expect((await f.session.submitBatch(await batch("\ufefftext", "\ufeffedited"))).accepted[0])
+      .toMatchObject({hash: await replicaTextHash("\ufeffedited")});
   });
   it("rejects binary and symlink mutations explicitly", async () => {
     const f = fixture("\0binary"); await f.session.checkpoint();
-    await expect(f.session.submitBatch(batch("\0binary", "text"))).rejects.toThrow(/binary/);
+    await expect(f.session.submitBatch(await batch("\0binary", "text"))).rejects.toThrow(/binary/);
     const g = fixture(); g.host.entries = async () => [{ path: "a.txt", mode: "120000", oid: "link" }];
     await g.session.checkpoint();
-    await expect(g.session.submitBatch(batch())).rejects.toThrow(/symlinks/);
+    await expect(g.session.submitBatch(await batch())).rejects.toThrow(/symlinks/);
   });
 });

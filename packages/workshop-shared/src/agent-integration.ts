@@ -81,7 +81,7 @@ export interface WorkspaceReplica extends WorkerEntrypoint {
   closeGitBootstrap(checkpointId: string): Promise<void>;
   /** Enumerate transforms captured by the checkpoint, not a moving HEAD. */
   readOverlay(checkpointId: string): Promise<Cursor<WorktreeChange>>;
-  /** Page canonical OTs. Expired cursors require a new checkpoint, not an empty successful page. */
+  /** Page canonical OTs. An invalidated epoch requires a new lease/checkpoint, never an empty success. */
   changesSince(cursor: string, limit: number): Promise<WorktreeChangesPage>;
   /** Validate anchors and scope, reconcile with existing OTs, and atomically persist a receipt. */
   submitBatch(batch: WorktreeReplicaBatch): Promise<WorktreeReplicaReceipt>;
@@ -91,13 +91,13 @@ export interface WorkspaceReplica extends WorkerEntrypoint {
   release(): Promise<void>;
 }
 
-/** Consistent, scoped bootstrap anchor with bounded retention. */
+/** Consistent, scoped bootstrap anchor; required journal history is retained while its lease is live. */
 export interface WorkspaceCheckpoint {
   /** Opaque checkpoint identity, not an arbitrary Git object capability. */
   checkpointId: string;
   /** Canonical cursor after all transforms included in this checkpoint. */
   cursor: string;
-  /** Immutable bases and stable collision-free mount names. */
+  /** Immutable bases; filesystem layout is the integration's policy. */
   worktrees: WorktreeBase[];
 }
 
@@ -107,8 +107,6 @@ export interface WorktreeBase {
   checkoutId: number;
   /** Agent-visible binding name. */
   binding: string;
-  /** Collision-free directory under /workspace. */
-  mountName: string;
   /** Immutable base commit, or null for an empty worktree. */
   baseCommit: string | null;
   /** Immutable root tree, or null for an empty worktree. */
@@ -141,7 +139,7 @@ export interface WorktreeChange {
 export interface WorktreeChangeEvent {
   /** Opaque sequence marker, never a client wall-clock timestamp. */
   cursor: string;
-  /** Originating replica batch, absent for ordinary DO edits. */
+  /** This replica's originating batch, absent for DO edits and other replicas' edits. */
   sourceBatchId?: string;
   /** Atomically accepted transforms, in canonical order. */
   changes: WorktreeChange[];
@@ -163,20 +161,13 @@ export interface WorktreeReplicaBatch {
   batchId: string;
   /** Last fully consumed canonical stream cursor. */
   baseCursor: string;
-  /** Replica-produced transforms; legacy envelopes remain readable during rolling upgrades. */
-  files: ({
+  /** Replica-produced transforms, calculated by the integration rather than re-diffed in core. */
+  files: {
     /** Checkout within the grant. */ checkoutId: number;
     /** Normalized relative path. */ path: string;
-  } & (
-    | {
-      /** SHA-256 of acknowledged UTF-8 text; null denotes absence, not an empty file. */ baseHash: string | null;
-      /** Frozen UTF-16 set/edit/remove OT; null captures an unchanged requested path. */ change: FileChange | null;
-    }
-    | {
-      /** Legacy acknowledged text, verified against baseCursor. */ before: string | null;
-      /** Legacy frozen text, diffed only for older clients. */ after: string | null;
-    }
-  ))[];
+    /** SHA-256 of acknowledged UTF-8 text; null denotes absence, not an empty file. */ baseHash: string | null;
+    /** Frozen UTF-16 set/edit/remove OT; null captures an unchanged requested path. */ change: FileChange | null;
+  }[];
 }
 
 /** Durable atomic acceptance; this receipt alone must not advance a replay cursor. */
@@ -188,11 +179,9 @@ export interface WorktreeReplicaReceipt {
   /** Transforms from frozen local content to accepted canonical content. */
   corrections: WorktreeChange[];
   /** Accepted anchors for touched paths only. */
-  accepted: ({
+  accepted: {
     /** Granted checkout. */ checkoutId: number;
     /** Normalized touched path. */ path: string;
-  } & (
-    | { /** SHA-256 of accepted UTF-8 text; null denotes absence. */ hash: string | null }
-    | { /** Legacy accepted text, never returned for compact batches. */ content: string | null }
-  ))[];
+    /** SHA-256 of accepted UTF-8 text; null denotes absence. */ hash: string | null;
+  }[];
 }
