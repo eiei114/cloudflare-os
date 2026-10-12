@@ -1241,8 +1241,10 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return result;
   }
 
-  // Agent discovery also offers optional ambient accounts, including accounts already added
-  // outside this chat. Resource pickers keep the default resource-only list.
+  /**
+   * Agent discovery also offers optional ambient accounts, including accounts already added
+   * outside this chat. Resource pickers keep the default resource-only list.
+   */
   async listGatekeeperVendors(filter: GatekeeperVendorFilter = {}, includeAmbient = false)
       : Promise<GatekeeperVendorInfo[]> {
     let options = {

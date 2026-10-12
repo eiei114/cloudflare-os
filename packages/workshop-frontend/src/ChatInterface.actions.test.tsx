@@ -164,8 +164,8 @@ describe('ChatInterface ambient connection requests', () => {
 
   async function showConnection() {
     const server = makeOverseer()
-    const accept = vi.fn(async (_requestId: string) => {})
-    const deny = vi.fn(async (_requestId: string) => {})
+    const accept = vi.fn<(requestId: string) => Promise<void>>(async () => {})
+    const deny = vi.fn<(requestId: string) => Promise<void>>(async () => {})
     Object.assign(server.overseer, { acceptConnectionRequest: accept, denyConnectionRequest: deny })
     const chat = withChatApi(server, undefined, [
       { id: 1, title: 'Chat', started: new Date(), lastActive: new Date() },
