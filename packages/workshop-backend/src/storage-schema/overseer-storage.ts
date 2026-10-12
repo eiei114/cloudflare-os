@@ -33,6 +33,10 @@ import type {
   HookDescription, ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import type { SpawnCallableOptions } from "../agent-spawner-binding";
+import type {
+  AgentIntegrationOrigin, AgentIntegrationTurn, AgentIntegrationParticipantRecord,
+} from "../agent-integration";
+import type { WorktreeReplicaLease, WorktreeReplicaCommit } from "../worktree-replica";
 
 // =======================================================================================
 // Workpieces
@@ -301,6 +305,27 @@ export type WorktreeRecord = {
  */
 export type WorkpieceRecord = GadgetRecord | WorktreeRecord;
 
+/** One logical repository whose objects share the workspace's content-addressed Git store. */
+export type WorkspaceRepositoryRecord = {
+  id: number;
+  kind: "gadget" | "external" | "attachments";
+  title: string;
+  created: Date;
+  /** Capability that supplied the original commit, when the repository came from a connection. */
+  sourceGatekeeperId?: WorkpieceId;
+  /** Denormalized durable identity/display fallback if that capability is later disconnected. */
+  resourceUrl?: string;
+};
+
+/** The stable on-disk identity of one workpiece checkout. */
+export type WorkspaceCheckoutRecord = {
+  workpieceId: WorkpieceId;
+  repositoryId: number;
+  /** Collision-free directory directly below `/workspace`. */
+  mountName: string;
+  created: Date;
+};
+
 // =======================================================================================
 // Git object store
 
@@ -426,6 +451,14 @@ export type ActionRecord = {
   description: ActionDescription;
   resolvedBy?: AiChatAuthorInfo;  // set when resolved (approved/rejected); absent while pending (or legacy)
   autoApproved?: boolean;         // set when applied by an auto-approval rule rather than a human
+  /** Queue-time authority; approval must not borrow an unrelated later turn. */
+  integrationOrigin?: AgentIntegrationOrigin;
+  /** Dispatches through the administrator-granted contextual action interface. */
+  contextualApply?: boolean;
+  /** Recovery must not append the same action-decision note twice. */
+  decisionNotified?: boolean;
+  /** Child approval IDs, persisted with submission for lost-ACK deduplication. */
+  followupActionIds?: number[];
 } | {
   type: "observation";
   description: ObservationDescription;
@@ -584,6 +617,9 @@ export type AiChatAgentContext = {
    */
   alwaysAvailableCapsuleIds?: WorkpieceId[];
 
+  /** Chat-private Git worktree receiving uploaded text attachments, including after seeding. */
+  attachments?: {worktreeId: WorkpieceId, bindingName: string};
+
   /**
    * The part of the agent's system prompt that lists the workspace's gadgets, each with its files
    * and bindings, saved when the chat's first turn built it.
@@ -715,6 +751,18 @@ export type ActiveAgentRecord = {
   initiator: AiChatAuthorInfo;
   /** Whether this turn was initiated by a gadget callback (vs. a chat message). */
   callbackInitiated: boolean;
+  /** Fences deferred recovery against a different execution of this chat after a DO restart. */
+  continuationId?: string;
+};
+
+/** Approved intent only for integrations explicitly granted durable effect recovery. */
+export type ActionApplication = {
+  id: number;
+  resolvedBy: AiChatAuthorInfo;
+  autoApproved: boolean;
+  resumeUserId?: string;
+  phase: "apply" | "resume";
+  retryAt: number;
 };
 
 /**
@@ -801,17 +849,24 @@ export type ExternalChatRecord = {
 type ChatAttachmentContentRecord = {
   fileId: string;
   data: Uint8Array;
-  state:
-    | {
-        type: "staged";
-        uploadedAt: number;
-        mimeType: string;
-        name?: string;
-      }
-    | {
-        type: "committed";
-        chatId: number;
-      };
+  state: {
+    type: "staged";
+    uploadedAt: number;
+    mimeType: string;
+    name?: string;
+  };
+} | {
+  fileId: string;
+  /** Retained only for binary attachments and text attachments committed before Git ingress. */
+  data?: Uint8Array;
+  state: {
+    type: "committed";
+    chatId: number;
+    /** Path in the chat's attachments worktree, for text attachments provisioned there. */
+    workspacePath?: string;
+    /** Immutable Git commit holding the upload's original text for replay and download. */
+    workspaceCommitId?: string;
+  };
 };
 
 // =======================================================================================
@@ -1129,6 +1184,7 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       //       where the chat log still told: those an agent created from a blueprint name it,
       //       and those created from scratch name none. Every gadget created from here on has
       //       an `upstream` once it is permanent.
+      //   6 = durable integration/replica journals and lazy repository/check-out identities.
       version: 0,
 
       // The workspace title. (Each chat, gatekeeper, and gadget has its own title, elsewhere.)
@@ -1171,6 +1227,8 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       nextChatId: 0,
       nextHookId: 0,
       nextAgentCallId: 0,
+      // Independent repository identities: multiple checkouts may share one logical repository.
+      nextRepositoryId: 0,
 
       // OBSOLETE: deadWorktreeIds existed to facilitate hiding worktrees from clients, but we
       // no longer do that. Noted here since old workspaces may still have a singleton by this
@@ -1195,6 +1253,29 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
     },
 
     collections: {
+      workspaceRepositories: collection<WorkspaceRepositoryRecord>()({
+        primaryKey: "id",
+        nonUniqueIndexes: {bySourceGatekeeper: record => record.sourceGatekeeperId ?? null},
+      }),
+      workspaceCheckouts: collection<WorkspaceCheckoutRecord>()({
+        primaryKey: "workpieceId",
+        uniqueIndexes: {byMountName: record => record.mountName},
+      }),
+      pausedAgents: collection<ActiveAgentRecord>()({primaryKey: "chatId"}),
+      actionApplications: collection<ActionApplication>()({
+        primaryKey: "id",
+        nonUniqueIndexes: {retryAt: record => record.retryAt},
+      }),
+      agentIntegrationTurns: collection<AgentIntegrationTurn>()({primaryKey: "chatId"}),
+      worktreeReplicaLeases: collection<WorktreeReplicaLease>()({primaryKey: "id"}),
+      worktreeReplicaCommits: collection<WorktreeReplicaCommit>()({
+        primaryKey: "id",
+        nonUniqueIndexes: {byLease: record => record.leaseId},
+      }),
+      agentIntegrationParticipants: collection<AgentIntegrationParticipantRecord>()({
+        primaryKey: "id",
+        nonUniqueIndexes: {byTurn: record => record.turnId, retryAt: record => record.retryAt ?? null},
+      }),
       // READ-ONLY LEGACY: the pre-git-storage incremental code log, tightly-packed from version 1
       // (there's no entry for version 0, the starting empty state). Nothing writes it anymore --
       // mainline code lives in `gitObjects` as commits -- and it is read only by the git-storage
