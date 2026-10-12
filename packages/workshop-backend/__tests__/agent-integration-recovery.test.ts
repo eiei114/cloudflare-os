@@ -2,7 +2,7 @@ import {env} from "cloudflare:workers";
 import {evictDurableObject, runInDurableObject} from "cloudflare:test";
 import {afterEach, describe, expect, it, vi} from "vitest";
 import type {OverseerDurableObject} from "../src/overseer";
-import type {UserDurableObject} from "../src/user";
+import {UserDurableObject} from "../src/user";
 import type {IntegrationTestParticipant} from "./test-worker";
 
 declare module "cloudflare:workers" {
@@ -51,7 +51,105 @@ function providerReply(): Response {
 }
 
 describe("integration cleanup at agent recovery boundaries", () => {
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+
+  it.each(["approval", "connection"] as const)("recovers interrupted %s teardown without inferring until an authorized wake-up", async reason => {
+    const name = crypto.randomUUID(), stub = env.TEST_OVERSEER.getByName(name);
+    const user = env.TEST_USER.getByName(crypto.randomUUID());
+    await runInDurableObject(user, instance => {
+      instance["storage"].profile.put(USER);
+      instance["storage"].aiModels.put(MODEL);
+    });
+    let requests = 0;
+    const realFetch = globalThis.fetch;
+    vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      if (url.origin !== MODEL.config.apiUrl) return realFetch(input, init);
+      ++requests;
+      return Promise.resolve(providerReply());
+    });
+    let continuationId: string, closingId: string;
+    await runInDurableObject(stub, async instance => {
+      const impl = instance.impl, participant = await prepare(impl, name);
+      const turn = impl.storage.agentIntegrationTurns.get(1)!;
+      continuationId = crypto.randomUUID();
+      const record = {chatId: 1, initiatorUserId: user.id.toString(), modelId: MODEL.profile.id,
+        initiator: USER, callbackInitiated: false, continuationId, requestKey: turn.requestKey};
+      impl.storage.activeAgents.put(record);
+      impl.storage.pausedAgents.put(record);
+      impl.storage.agentIntegrationTurns.put({...turn, continuationId});
+      impl.storage.chatMeta.put({...impl.storage.chatMeta.get(1)!, activeAgent: MODEL.profile});
+      await participant.setFailure(true);
+      await expect(impl.closeAgentIntegrationTurn(1, reason)).rejects.toThrow(/unavailable/);
+      closingId = impl.storage.agentIntegrationTurns.get(1)!.closing!.eventId;
+      await participant.setFailure(false);
+      await impl.ctx.storage.sync();
+    });
+    await evictDurableObject(stub);
+    await runInDurableObject(stub, async instance => {
+      const impl = instance.impl;
+      impl.env.AGENT_INTEGRATION_GRANTS = GRANT;
+      try {
+        await impl.waitForAllAgentsToComplete();
+        expect(requests).toBe(0);
+        expect(impl.storage.activeAgents.get(1)).toBeUndefined();
+        expect(impl.storage.chatMeta.get(1)?.activeAgent).toBeUndefined();
+        expect(impl.storage.pausedAgents.get(1)?.continuationId).toBe(continuationId);
+        expect(impl.storage.agentIntegrationTurns.get(1)).toMatchObject({state: "suspended",
+          closing: {kind: "suspended", reason, eventId: closingId}});
+        expect([...impl.storage.agentIntegrationParticipants.list()][0].pending).toEqual([]);
+        // The decision handler's wake-up removes the paused marker before recovery.
+        await impl.resumePausedAgent(1);
+        await impl.waitForAllAgentsToComplete();
+        expect(requests).toBe(1);
+        expect(impl.storage.pausedAgents.get(1)).toBeUndefined();
+        expect(impl.storage.agentIntegrationTurns.get(1)?.closing?.kind).toBe("finished");
+      } finally { delete impl.env.AGENT_INTEGRATION_GRANTS; }
+    });
+  });
+
+  it("clears busy bookkeeping when canceled during recovery's model lookup", async () => {
+    const name = crypto.randomUUID(), stub = env.TEST_OVERSEER.getByName(name);
+    const user = env.TEST_USER.getByName(crypto.randomUUID());
+    let entered = false, canceled = false, release: () => void;
+    const getContext = UserDurableObject.prototype.getChatContext;
+    vi.spyOn(UserDurableObject.prototype, "getChatContext").mockImplementation(async function(modelId) {
+      entered = true;
+      await new Promise<void>(resolve => { release = resolve; });
+      return getContext.call(this, modelId);
+    });
+    await runInDurableObject(user, instance => {
+      instance["storage"].profile.put(USER);
+      instance["storage"].aiModels.put(MODEL);
+    });
+    await runInDurableObject(stub, async instance => {
+      const impl = instance.impl;
+      await prepare(impl, name);
+      const turn = impl.storage.agentIntegrationTurns.get(1)!;
+      impl.storage.activeAgents.put({chatId: 1, initiatorUserId: user.id.toString(), modelId: MODEL.profile.id,
+        initiator: USER, callbackInitiated: false, continuationId: crypto.randomUUID(), requestKey: turn.requestKey});
+      impl.storage.chatMeta.put({...impl.storage.chatMeta.get(1)!, activeAgent: MODEL.profile});
+      await impl.ctx.storage.sync();
+    });
+    await evictDurableObject(stub);
+    const completed = runInDurableObject(stub, async instance => {
+      const impl = instance.impl;
+      impl.env.AGENT_INTEGRATION_GRANTS = GRANT;
+      try {
+        await vi.waitFor(() => expect(entered).toBe(true));
+        impl.cancelAgent(1);
+        canceled = true;
+        await impl.waitForAllAgentsToComplete();
+        expect(impl.storage.activeAgents.get(1)).toBeUndefined();
+        expect(impl.storage.pausedAgents.get(1)).toBeUndefined();
+        expect(impl.storage.chatMeta.get(1)?.activeAgent).toBeUndefined();
+        expect(impl.storage.agentIntegrationTurns.get(1)).toMatchObject({state: "finished", closing: {reason: "canceled"}});
+      } finally { delete impl.env.AGENT_INTEGRATION_GRANTS; }
+    });
+    await vi.waitFor(() => expect(canceled).toBe(true));
+    await runInDurableObject(user, () => release());
+    await completed;
+  });
 
   it.each(["new request", "same request"])("does not discard a newer execution of a %s during previous cleanup", async request => {
     const name = crypto.randomUUID(), stub = env.TEST_OVERSEER.getByName(name);

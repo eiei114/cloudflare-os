@@ -179,9 +179,9 @@ export interface WorktreeTurnAccess {
   /** Changes when a tool mutates the turn overlay; guards asynchronous replica reads. */
   getRevision?(): number;
 
-  /** Durably accept a replica batch, or return false if a tool changed its merge base. */
+  /** Durably accept a replica batch; validate its receipt/version inside the serialized barrier. */
   flushReplica?(change: CodeChange, revision: number,
-    commit?: WorktreeReplicaCommit): Promise<boolean>;
+    commit?: WorktreeReplicaCommit, validate?: () => boolean): Promise<boolean>;
 
   /**
    * Buffer a commit() head advancement for the step barrier, which validates the previousHead
@@ -2870,7 +2870,7 @@ async function runAgentPass(
   let stepBarrierError: unknown;
   const progressLogger = logger.with({chatId, executionId: crypto.randomUUID()});
   let barrierSequence = 0;
-  let persistStep = <T>(operation: () => Promise<T>): Promise<T> => {
+  let persistStep = <T>(operation: () => Promise<T>, isDurabilityFailure = () => true): Promise<T> => {
     const sequence = ++barrierSequence, queuedAt = Date.now();
     progressLogger.debug("agent persistence queued", {event: "agent.step.persist.queued", sequence});
     let result = stepBarrier.then(async () => {
@@ -2884,7 +2884,7 @@ async function runAgentPass(
       progressLogger.debug("agent persistence completed", {event: "agent.step.persist.completed", sequence,
         durationMs: Date.now() - queuedAt});
     }, error => {
-      stepBarrierError = error;
+      if (isDurabilityFailure()) stepBarrierError = error;
       progressLogger.debug("agent persistence failed", {event: "agent.step.persist.failed", sequence,
         durationMs: Date.now() - queuedAt});
     });
@@ -2994,32 +2994,37 @@ async function runAgentPass(
       pendingWorktreeCommits.push({worktreeId: id, commit, previousHead});
       pinWorktreeInSession(id);
     },
-    flushReplica: async (change, revision, replicaCommit) => {
-      if (revision !== workspaceRevision || !await appendReplicaChanges(change, revision)) {
-        return false;
-      }
-      // Live shell effects deliberately become durable before their eventual tool-result
-      // transcript. A crashed command must not lose the whole command's workspace edits.
-      let changes = stepBuffer.changes;
-      stepBuffer.changes = [];
-      stepBuffer.bytes = 0;
-      let createdGadgets = pendingCreatedGadgets;
-      pendingCreatedGadgets = [];
-      let createdWorktrees = pendingCreatedWorktrees;
-      pendingCreatedWorktrees = [];
-      let addedBindings = pendingAddedBindings;
-      pendingAddedBindings = [];
-      let worktreeCommits = pendingWorktreeCommits;
-      pendingWorktreeCommits = [];
-      let blueprintMerges = pendingBlueprintMerges;
-      pendingBlueprintMerges = [];
-      await persistStep(async () => {
+    flushReplica: (change, revision, replicaCommit, validate) => {
+      let committing = false;
+      return persistStep(async () => {
+        // Serialize receipt/version checks with append and persistence. A duplicate no-op does
+        // not advance the in-memory revision, but must never reach the durable barrier twice.
+        // Validation failures before committing remain request errors, not fatal storage errors.
+        if ((validate && !validate()) || revision !== workspaceRevision || !await appendReplicaChanges(change, revision)) {
+          return false;
+        }
+        // Live shell effects deliberately become durable before their eventual tool-result
+        // transcript. A crashed command must not lose the whole command's workspace edits.
+        let changes = stepBuffer.changes;
+        stepBuffer.changes = [];
+        stepBuffer.bytes = 0;
+        let createdGadgets = pendingCreatedGadgets;
+        pendingCreatedGadgets = [];
+        let createdWorktrees = pendingCreatedWorktrees;
+        pendingCreatedWorktrees = [];
+        let addedBindings = pendingAddedBindings;
+        pendingAddedBindings = [];
+        let worktreeCommits = pendingWorktreeCommits;
+        pendingWorktreeCommits = [];
+        let blueprintMerges = pendingBlueprintMerges;
+        pendingBlueprintMerges = [];
+        committing = true;
         if (await hooks.commitAgentStep(chatId, author, [], {
           changes, createdGadgets, createdWorktrees, addedBindings, worktreeCommits,
           blueprintMerges, replicaCommit,
         })) ++nextChangeId;
-      });
-      return true;
+        return true;
+      }, () => committing);
     },
   };
 

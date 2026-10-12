@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import type { OverseerDurableObject } from "../src/overseer";
@@ -213,6 +213,26 @@ async function compactBatch(before: string | null, after: string | null): Promis
 }
 
 describe("scoped native worktree replica protocol", () => {
+  it("rejects oversized canonical correction receipts before the barrier and permits a bounded retry", async () => {
+    const f = fixture(null);
+    await f.session.checkpoint();
+    const paths = Array.from({length: 5}, (_, i) => `file-${i}.txt`);
+    for (const path of paths) f.remoteChange({7: [[path, {set: "漢".repeat(220_000)}]]});
+    const input: WorktreeReplicaBatch = {batchId: "large-receipt", baseCursor: "cursor-0",
+      files: paths.map(path => ({checkoutId: 7, path, baseHash: null, change: null}))};
+    expect(JSON.stringify(input).length).toBeLessThan(1000);
+    const commit = vi.spyOn(f.host, "commit");
+    await expect(f.session.submitBatch(input)).rejects.toThrow(/receipt exceeds its budget/);
+    expect(commit).not.toHaveBeenCalled();
+    expect(f.commits.size).toBe(0);
+    // Rejected IDs were not consumed, and smaller receipts remain writable/idempotent.
+    const retry = {...input, files: input.files.slice(0, 1)};
+    const receipt = await f.session.submitBatch(retry);
+    expect(receipt.accepted).toEqual([{checkoutId: 7, path: paths[0], hash: await replicaTextHash("漢".repeat(220_000))}]);
+    expect(await f.session.submitBatch(retry)).toEqual(receipt);
+    expect(commit).toHaveBeenCalledTimes(1);
+  });
+
   it.each(workspaceCollisionCases)("keeps compact OTs on the existing collision policy for $name", async collision => {
     const f = fixture(collision.before); await f.session.checkpoint();
     f.remote(collision.doText);

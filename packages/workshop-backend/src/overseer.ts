@@ -1039,29 +1039,31 @@ class OverseerImpl implements AgentHooks {
   // DO (we don't persist the secret API token), then runs the agent loop, which rebuilds its state
   // by replaying the persisted chat log.
   async #resumeAgent(record: ActiveAgentRecord, liveChat: LiveChatContext) {
-    if (!this.storage.activeAgents.get(record.chatId) || liveChat.cancelController.signal.aborted) return;
+    if (!this.storage.activeAgents.get(record.chatId) || liveChat.cancelController.signal.aborted) {
+      await this.#finishAgentRecovery(record, liveChat);
+      return;
+    }
     if (!record.continuationId || record.requestKey === undefined) {
       record = {...record, continuationId: record.continuationId ?? crypto.randomUUID(),
         requestKey: record.requestKey ?? this.#agentRequestKey(record.chatId)};
       this.storage.activeAgents.put(record);
     }
     const closed = this.storage.agentIntegrationTurns.get(record.chatId);
-    if (closed?.state === "finished" && closed.closing?.kind === "finished" &&
+    const paused = this.storage.pausedAgents.get(record.chatId);
+    const suspending = closed?.state === "suspended" &&
+        paused?.continuationId === record.continuationId;
+    if ((closed?.closing?.kind === "finished" || closed?.closing?.kind === "suspended") &&
+        (closed.state === "finished" || suspending) &&
         (closed.continuationId !== undefined ? closed.continuationId === record.continuationId
           : closed.requestKey === record.requestKey)) {
-      // The model finished before reset, but teardown had not removed activeAgents.
-      // Drain its durable cleanup outbox rather than infer again for a completed prompt.
+      // The model finished or paused before reset, but teardown still owns activeAgents.
+      // An authorized wake-up removes pausedAgents before recovery, unlike this interrupted pause.
       try { await this.closeAgentIntegrationTurn(record.chatId, closed.closing.reason); }
       catch (error) {
         if (isDoResetError(error)) { this.#deferAgentResume(record, liveChat); return; }
         this.logger.warn("interrupted agent cleanup deferred", {event: "agent.resume.cleanup.deferred", error});
       }
-      await this.reconcilePendingGadgets(record.chatId);
-      const meta = this.storage.chatMeta.get(record.chatId);
-      if (meta) { delete meta.activeAgent; this.storage.chatMeta.put(meta); }
-      this.storage.pausedAgents.delete(record.chatId);
-      this.#unregisterRunningAgent(record.chatId);
-      this.#finishAgentTurn(record.chatId);
+      await this.#finishAgentRecovery(record, liveChat, suspending);
       return;
     }
     let aiModel: UserAiModelRecord | undefined;
@@ -1091,7 +1093,11 @@ class OverseerImpl implements AgentHooks {
     }
 
     const active = this.storage.activeAgents.get(record.chatId);
-    if (!this.#runningAgents.has(record.chatId) || !active || active.continuationId !== record.continuationId) return;
+    if (liveChat.cancelController.signal.aborted || !active) {
+      await this.#finishAgentRecovery(record, liveChat);
+      return;
+    }
+    if (!this.#runningAgents.has(record.chatId) || active.continuationId !== record.continuationId) return;
     if (!aiModel) {
       // The model is no longer available; we can't resume. Post an error and clear state. Clear
       // `activeAgent` and tear down the registry/record atomically (matching `#runAgentTurn`'s
@@ -1104,15 +1110,7 @@ class OverseerImpl implements AgentHooks {
         if (isDoResetError(error)) { this.#deferAgentResume(record, liveChat); return; }
         this.logger.warn("interrupted agent cleanup deferred", {event: "agent.resume.cleanup.deferred", error});
       }
-      let meta = this.storage.chatMeta.get(record.chatId);
-      if (meta) {
-        delete meta.activeAgent;
-        meta.lastActive = this.getChatTimestamp();
-        this.storage.chatMeta.put(meta);
-      }
-      this.#unregisterRunningAgent(record.chatId);
-      this.storage.pausedAgents.delete(record.chatId);
-      this.#finishAgentTurn(record.chatId);
+      await this.#finishAgentRecovery(record, liveChat);
       return;
     }
 
@@ -1127,13 +1125,37 @@ class OverseerImpl implements AgentHooks {
         record.continuationId!, record.callbackInitiated, liveChat);
   }
 
+  // Recovery can end before entering the agent loop's finally. Fence its teardown across awaits:
+  // cancellation may have removed the row, or a newer execution may now own this chat.
+  async #finishAgentRecovery(record: ActiveAgentRecord, liveChat: LiveChatContext,
+      preservePause = false): Promise<void> {
+    const ownsChat = () => this.#liveChats.get(record.chatId) === liveChat &&
+        (!this.storage.activeAgents.get(record.chatId) ||
+          this.storage.activeAgents.get(record.chatId)?.continuationId === record.continuationId);
+    if (!ownsChat()) return;
+    await this.reconcilePendingGadgets(record.chatId);
+    if (!ownsChat()) return;
+    const meta = this.storage.chatMeta.get(record.chatId);
+    if (meta) {
+      delete meta.activeAgent;
+      meta.lastActive = this.getChatTimestamp();
+      this.storage.chatMeta.put(meta);
+    }
+    if (!preservePause) this.storage.pausedAgents.delete(record.chatId);
+    this.#worktreeReplicaTurns.delete(record.chatId);
+    this.#unregisterRunningAgent(record.chatId);
+    this.#finishAgentTurn(record.chatId);
+  }
+
   // The durable activeAgents row is the restart backstop; the timer only avoids a
   // tight retry loop when another DO is temporarily resetting in this incarnation.
   #deferAgentResume(record: ActiveAgentRecord, liveChat: LiveChatContext): void {
     this.ctx.waitUntil((async () => {
       await scheduler.wait(1_000);
-      if (this.storage.activeAgents.get(record.chatId)?.continuationId === record.continuationId &&
-          !liveChat.cancelController.signal.aborted) await this.#resumeAgent(record, liveChat);
+      if (liveChat.cancelController.signal.aborted ||
+          this.storage.activeAgents.get(record.chatId)?.continuationId === record.continuationId) {
+        await this.#resumeAgent(record, liveChat);
+      }
     })());
   }
 
@@ -2993,8 +3015,7 @@ class OverseerImpl implements AgentHooks {
   // transformed change against current content, and append/broadcast -- everything from the final
   // state re-read through the row write in one synchronous step.
   async submitCodeChange(chatId: number, submission: CodeChangeSubmission,
-                         author: AiChatAuthorInfo, userId: string,
-                         options?: {allowDuringMessagePreparation?: boolean})
+                         author: AiChatAuthorInfo, userId: string)
       : Promise<{generation: number, revision: number}> {
     this.getChatMetaOrThrow(chatId);  // fail fast
     this.#validateSubmissionShape(submission);
@@ -3015,8 +3036,7 @@ class OverseerImpl implements AgentHooks {
       let meta = this.getChatMetaOrThrow(chatId);
       // While an agent turn is active (or a message is being prepared to start one), reject
       // retryably: the client keeps its queue and resubmits after the turn.
-      if (meta.activeAgent ||
-          (this.isPreparingChatMessage(chatId) && !options?.allowDuringMessagePreparation)) {
+      if (meta.activeAgent || this.isPreparingChatMessage(chatId)) {
         throw new Error(AGENT_RUNNING_ERROR_MESSAGE);
       }
       let codeBase = this.chatCodeBase(meta);
@@ -3121,8 +3141,7 @@ class OverseerImpl implements AgentHooks {
         return acked;
       }
       let fresh = this.getChatMetaOrThrow(chatId);
-      if (fresh.activeAgent ||
-          (this.isPreparingChatMessage(chatId) && !options?.allowDuringMessagePreparation)) {
+      if (fresh.activeAgent || this.isPreparingChatMessage(chatId)) {
         throw new Error(AGENT_RUNNING_ERROR_MESSAGE);
       }
       let freshBase = this.chatCodeBase(fresh);
@@ -5599,22 +5618,26 @@ class OverseerImpl implements AgentHooks {
     return record;
   }
 
-  async #appendWorkspaceAttachments(
+  #appendWorkspaceAttachments(
       chatId: number, worktree: WorktreeRecord, files: ReadonlyMap<string, string>,
-      author: AiChatAuthorInfo): Promise<void> {
+      author: AiChatAuthorInfo): void {
+    const current = this.storage.gadgets.get(worktree.id);
+    if (current?.type !== "worktree" || current.chatId !== chatId || current.pinBase !== worktree.pinBase) {
+      throw new Error("Attachment worktree changed while preparing the message; retry.");
+    }
     for (let [path, text] of files) {
-      let meta = this.getChatMetaOrThrow(chatId);
-      let codeBase = this.chatCodeBase(meta);
-      let pinned = codeBase.pins.some(pin => pin.gadgetId === worktree.id);
-      await this.submitCodeChange(chatId, {
-        generation: codeBase.generation,
-        revision: codeBase.revision,
-        clientId: `attachment_${crypto.randomUUID().replaceAll("-", "")}`,
-        seq: 1,
-        ...(!pinned ? {pins: [{gadgetId: worktree.id, baseCommit: worktree.pinBase}]} : {}),
-        change: {[worktree.id]: [[path, {set: text}]]},
-      }, author, author.id, {allowDuringMessagePreparation: true});
-      this.materializeChatChanges(chatId, undefined, {author});
+      const meta = this.getChatMetaOrThrow(chatId), base = this.chatCodeBase(meta);
+      const cached = this.#chatContentCache.get(chatId);
+      if (!cached || cached.generation !== base.generation || cached.revision !== base.revision) {
+        throw new Error("Attachment workspace changed while preparing the message; retry.");
+      }
+      const change: CodeChange = {[worktree.id]: [[path, {set: text}]]};
+      validateCodeChangeSchema(change);
+      validateCodeChangeContent(change, cached.content);
+      const pins = base.pins.some(pin => pin.gadgetId === worktree.id) ? [] :
+        [{gadgetId: worktree.id, baseCommit: worktree.pinBase, mergedCommit: worktree.pinBase}];
+      this.#appendChatChangeRow(chatId, meta, author, change, pins, applyCodeChange(cached.content, change));
+      this.materializeChatChanges(chatId, undefined, {author, allowDuringTurn: true});
     }
   }
 
@@ -6423,6 +6446,12 @@ class OverseerImpl implements AgentHooks {
     const turn = lease && this.storage.agentIntegrationTurns.get(lease.chatId);
     if (!lease || lease.released || lease.expiresAt <= Date.now() || turn?.turnId !== lease.turnId ||
         !this.integrationGrant(lease.gatekeeperId).worktreeReplica) throw new Error("Replica lease expired or revoked.");
+    if (turn.state === "finished" && (!lease.cleanupDeadline || lease.cleanupDeadline <= Date.now() ||
+        ![...this.storage.agentIntegrationParticipants.byTurn.get(turn.turnId)].some(participant =>
+          participant.gatekeeperId === lease.gatekeeperId && participant.pending.some(event =>
+            event.kind === "finished" && event.eventId === turn.closing?.eventId)))) {
+      throw new Error("Replica lease expired or revoked after turn termination.");
+    }
     const meta = this.storage.chatMeta.get(lease.chatId);
     if (!meta || lease.checkpoint &&
         Number(lease.checkpoint.cursor.split(":").at(-2)) !== this.chatCodeBase(meta).generation) {
@@ -6504,7 +6533,11 @@ class OverseerImpl implements AgentHooks {
       return (await this.gitCache.ensureObject(entry.oid, { type: "blob", referencedBy: entry.referencedBy })).payload;
     };
     const host: WorktreeReplicaHost = {
-      requireLease: id => this.requireReplicaLease(id), saveLease: lease => this.storage.worktreeReplicaLeases.put(lease),
+      requireLease: id => this.requireReplicaLease(id), saveLease: lease => {
+        const current = this.requireReplicaLease(lease.id);
+        this.storage.worktreeReplicaLeases.put({...lease, cleanupDeadline: current.cleanupDeadline,
+          expiresAt: Math.min(lease.expiresAt, current.cleanupDeadline ?? Infinity)});
+      },
       entries, baseFile,
       gitPack: async (lease, checkoutId, request) => {
         const commit = lease.worktrees.find(tree => tree.checkoutId === checkoutId)?.baseCommit;
@@ -6583,7 +6616,10 @@ class OverseerImpl implements AgentHooks {
         if (this.replicaVersion(lease) !== version) return false;
         const active = this.#worktreeReplicaTurns.get(lease.chatId);
         try {
-          if (active?.access.flushReplica) return await active.access.flushReplica(change, active.access.getRevision?.() ?? 0, receipt);
+          if (active?.access.flushReplica) return await active.access.flushReplica(change, active.access.getRevision?.() ?? 0, receipt, () => {
+            this.requireReplicaLease(lease.id);
+            return this.replicaVersion(lease) === version && !this.storage.worktreeReplicaCommits.get(receipt.id);
+          });
           // A suspended/recovered turn needs the same first-write gadget pins as the live path.
           // Use the lease's immutable base, never a newer mainline head; the barrier validates it.
           const pins = this.chatCodeBase(this.storage.chatMeta.get(lease.chatId)!).pins;
@@ -6710,6 +6746,17 @@ class OverseerImpl implements AgentHooks {
     const participants = [...this.storage.agentIntegrationParticipants.byTurn.get(turn.turnId)];
     this.storage.transaction(() => {
       this.storage.agentIntegrationTurns.put(closed);
+      if (closed.state === "finished" && turn.state !== "finished") {
+        // Final sync needs residual authority, but only registered cleanup participants retain it.
+        // Give it the callback's existing one-hour bound, fixed before dispatch and never renewed.
+        const leases = [...this.storage.worktreeReplicaLeases.list()];
+        for (const lease of leases) {
+          if (lease.turnId === turn.turnId && !lease.released && lease.expiresAt > Date.now() &&
+              participants.some(participant => participant.gatekeeperId === lease.gatekeeperId)) {
+            this.storage.worktreeReplicaLeases.put({...lease, cleanupDeadline: Date.now() + 60 * 60 * 1_000});
+          }
+        }
+      }
       for (const record of participants) {
         if (!record.pending.some(event => event.eventId === closed.closing!.eventId)) {
           record.pending.push(closed.closing!);
@@ -7154,8 +7201,13 @@ class OverseerImpl implements AgentHooks {
     if (attachmentsWorktree !== undefined) {
       attachmentSourceCommit = await this.#writeWorkspaceAttachmentCommit(
           attachmentFiles, userMeta.profile);
-      await this.#appendWorkspaceAttachments(
-          chatId, attachmentsWorktree, attachmentFiles, userMeta.profile);
+      // Prefetch only. Workspace rows and attachment references land with the validated message.
+      if (attachmentFiles.size) {
+        await this.getCurrentChatContent(chatId, this.getChatMetaOrThrow(chatId));
+        for (const path of attachmentFiles.keys()) {
+          await this.gitCache.assertWorktreePathWritable(attachmentsWorktree.pinBase, path);
+        }
+      }
     } else {
       preparedAttachmentsWorktree = await this.#prepareAttachmentsWorktree(
           chatId, attachmentFiles, userMeta.profile);
@@ -7172,23 +7224,33 @@ class OverseerImpl implements AgentHooks {
     if (runsAgentTurn && userMeta.aiModel) {
       meta.activeAgent = userMeta.aiModel.profile;
     }
-    this.ctx.storage.transactionSync(() => {
-      this.storage.chatMeta.put(meta);
-      let promptSequence = this.#commitPreparedChatMessage(
-          chatId, meta.lastActive, userMeta.profile, prepared, capsules, canonicalAttachments,
-          formats, preparedAttachmentsWorktree, attachmentSourceCommit);
-      if (responseTargetRegistration) {
-        if (promptSequence === undefined) {
-          throw new Error("External messages require a prompt.");
+    try {
+      this.ctx.storage.transactionSync(() => {
+        this.storage.chatMeta.put(meta);
+        let promptSequence = this.#commitPreparedChatMessage(
+            chatId, meta.lastActive, userMeta.profile, prepared, capsules, canonicalAttachments,
+            formats, preparedAttachmentsWorktree, attachmentSourceCommit);
+        if (attachmentsWorktree && attachmentFiles.size) {
+          this.#appendWorkspaceAttachments(chatId, attachmentsWorktree, attachmentFiles, userMeta.profile);
         }
-        this.registerExternalMessageResponseTarget(
-          responseTargetRegistration.idempotencyKey,
-          chatId,
-          promptSequence,
-          responseTargetRegistration.chatGatewayRpcTarget,
-        );
-      }
-    });
+        if (responseTargetRegistration) {
+          if (promptSequence === undefined) {
+            throw new Error("External messages require a prompt.");
+          }
+          this.registerExternalMessageResponseTarget(
+            responseTargetRegistration.idempotencyKey,
+            chatId,
+            promptSequence,
+            responseTargetRegistration.chatGatewayRpcTarget,
+          );
+        }
+      });
+    } catch (error) {
+      // The row appender updates disposable caches too; discard them after storage rollback.
+      this.invalidateChatContent(chatId);
+      this.#liveWindowCache.delete(chatId);
+      throw error;
+    }
 
     if (runsAgentTurn && userMeta.aiModel) {
       let needsAgentTurnKeepAlive = responseTargetRegistration !== undefined;

@@ -23,6 +23,11 @@ to legacy application after a partial contextual dispatch.
 
 One logical turn may have several invocation segments. Started/resumed/suspended/finished
 events have durable IDs and an at-least-once outbox. Participants must deduplicate them.
+Terminal turns revoke ordinary replica access. Only already-registered participants with an
+unacknowledged terminal callback retain final-sync access, within a fixed persisted one-hour
+cleanup deadline (the lifecycle callback's existing bound). Lease renewal is capped at that
+deadline; callback ACK, expiry, release and revocation fence further access. Cleanup retries and
+DO resets never restart that clock or resurrect expired leases.
 Nested approvals use the existing action queue: durable submission does not grant permission.
 Recoverable actions retain their origin and dispatch identity across resets rather than
 executing under a new user prompt.
@@ -38,6 +43,10 @@ the head/pin and records its declaration, so the proposal can subsequently be ac
 Active continuations persist the initiating request before asynchronous startup, and each published
 integration segment records its execution identity. Recovery skips inference for a completed segment
 only when its terminal journal belongs to that continuation; older cleanup cannot discard a new prompt.
+Interrupted suspension cleanup retains the paused continuation without inferring; only an authorized
+decision wake-up removes that marker. Cancellation during recovery's awaited reconciliation/model
+lookup clears running/visible busy state, fenced by continuation and live context so old cleanup
+cannot clear a newer execution.
 If model recovery fails, terminal callbacks are journalled before active state is cleared and the alarm
 retries failed cleanup. Malformed model transforms are rejected before buffering and logged with only
 stage/count diagnostics, preserving their tool-error transcript instead of aborting at persistence.
@@ -65,6 +74,9 @@ barrier from a dispatched model request; stream creation is not receipt of provi
    checks path/checkout scope and base anchors, applies the existing OT resolution rules, and
    atomically stores a payload-bound batch receipt. Identical retries return the same receipt;
    reusing an ID for different content fails. Corrections bring the replica to canonical content.
+   Both accepted OTs and durable correction receipts are bounded before the persistence barrier.
+   Even a no-op from a stale cursor can need large corrections; an oversized receipt is rejected
+   without committing or consuming its batch ID. Catch up canonical events or submit fewer paths.
 6. Renew within the original grant/turn bounds; release fences further writes without removing
    already accepted changes. Live leases retain their required journal rows beyond the ordinary
    retired-row TTL, so caught-up clients can reconstruct anchors after long commands or DO resets.
@@ -74,12 +86,17 @@ barrier from a dispatched model request; stream creation is not receipt of provi
 Journal events tag each replica-owned OT row with its batch, including an empty acceptance marker
 for no-op batches. Ordinary DO edits flushed at the same barrier are not tagged. Echo batch IDs
 are lease-local: another replica never mistakes a coincidentally equal batch ID for its own write.
+The live barrier serializes receipt/version revalidation with append and persistence, so a
+concurrent duplicate no-op returns the stored receipt without poisoning subsequent agent steps.
 
 UTF-8 text attachments within the OT text-size limit become ordinary worktree files; BOMs are
 preserved as content, and downloads read the original Git blob bytes. Upload names reserve existing
 base and accepted/pending overlay root names, including directories, without reading their contents.
 Rev 0 leaves non-UTF-8 and oversized text attachments in the byte-preserving attachment store rather
 than creating lossy text or rejecting an otherwise valid upload at the OT persistence barrier.
+Attachment bytes and tree metadata are prefetched, but worktree projection, attachment references
+and the validated user message commit together. A rejected send leaves the upload staged and no
+new workspace path; retry does not allocate a suffix for a file the failed send never committed.
 
 The bootstrap API preserves Git modes and binary base bytes. Rev 0 mutation submission is text
 only; it does not promise arbitrary binary/mode/Gitlink mutation support. A client cannot push

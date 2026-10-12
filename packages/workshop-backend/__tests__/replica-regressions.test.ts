@@ -7,6 +7,7 @@ import {applyCodeChange, MAX_FILE_TEXT_LENGTH, type CodeChange} from "@gadgets/w
 import {replicaTextHash} from "../src/workspace-replica";
 import {runAgent} from "../src/agent";
 import {createFauxCore, fauxAssistantMessage, fauxText, fauxToolCall} from "@earendil-works/pi-ai";
+import type {IntegrationTestParticipant} from "./test-worker";
 
 declare module "cloudflare:workers" {
   interface ProvidedEnv {
@@ -52,6 +53,131 @@ async function open(impl: Impl, chatId = 1, gatekeeperId = 31) {
 }
 
 describe("replica review regressions over durable kernel storage", () => {
+  it.each(["completed", "canceled", "failed"] as const)("revokes an unregistered replica after the turn is %s", reason => inKernel(crypto.randomUUID(), async impl => {
+    const tree = await worktree(impl);
+    await impl.beginAgentIntegrationTurn(1);
+    const replica = await open(impl), checkpoint = await replica.checkpoint();
+    await impl.closeAgentIntegrationTurn(1, reason);
+    await expect((async () => { await replica.renew(); })()).rejects.toThrow(/expired or revoked/);
+    await expect((async () => { await replica.submitBatch({batchId: "after-stop", baseCursor: checkpoint.cursor, files: [
+      {checkoutId: tree.id, path: "a.txt", baseHash: await replicaTextHash("aaa"), change: {set: "unauthorized"}},
+    ]}); })()).rejects.toThrow(/expired or revoked/);
+    expect([...impl.storage.worktreeReplicaCommits.list()]).toEqual([]);
+  }));
+
+  it("bounds registered final-sync authority across reset, renewal, callback ACK and expiry", async () => {
+    const name = crypto.randomUUID();
+    const saved = await inKernel(name, async impl => {
+      impl.env.AGENT_INTEGRATION_GRANTS = '{"container":{"worktreeReplica":true,"lifecycle":true}}';
+      const tree = await worktree(impl);
+      await impl.beginAgentIntegrationTurn(1);
+      const exports = impl.ctx.exports as Cloudflare.Exports & {
+        IntegrationTestParticipant(options: {props: {name: string}}): Fetcher<IntegrationTestParticipant>;
+      };
+      const participant = exports.IntegrationTestParticipant({props: {name}});
+      await impl.registerIntegrationParticipant(31, impl.captureIntegrationOrigin({from: "agent", chatId: 1})!, "running", participant);
+      const replica = await open(impl), checkpoint = await replica.checkpoint();
+      await participant.setFailure(true);
+      await expect(impl.closeAgentIntegrationTurn(1, "completed")).rejects.toThrow(/unavailable/);
+      const leaseId = checkpoint.cursor.split(":")[0];
+      const lease = impl.storage.worktreeReplicaLeases.get(leaseId)!;
+      expect(lease.cleanupDeadline! - Date.now()).toBeLessThanOrEqual(60 * 60 * 1000);
+      await impl.ctx.storage.sync();
+      return {treeId: tree.id, leaseId, cursor: checkpoint.cursor, deadline: lease.cleanupDeadline!};
+    });
+    await abortAllDurableObjects();
+    await inKernel(name, async impl => {
+      impl.env.AGENT_INTEGRATION_GRANTS = '{"container":{"worktreeReplica":true,"lifecycle":true}}';
+      const replica = impl.getWorkspaceReplicaSession(saved.leaseId);
+      await expect(impl.closeAgentIntegrationTurn(1, "completed")).rejects.toThrow(/unavailable/);
+      expect(impl.storage.worktreeReplicaLeases.get(saved.leaseId)?.cleanupDeadline).toBe(saved.deadline);
+      await replica.submitBatch({batchId: "final-sync", baseCursor: saved.cursor, files: [
+        {checkoutId: saved.treeId, path: "a.txt", baseHash: await replicaTextHash("aaa"), change: {set: "saved before snapshot"}},
+      ]});
+      const lease = impl.storage.worktreeReplicaLeases.get(saved.leaseId)!;
+      impl.storage.worktreeReplicaLeases.put({...lease, cleanupDeadline: Date.now() + 1000});
+      await replica.renew();
+      const renewed = impl.storage.worktreeReplicaLeases.get(saved.leaseId)!;
+      expect(renewed.expiresAt).toBe(renewed.cleanupDeadline);
+      impl.storage.worktreeReplicaLeases.put({...renewed, cleanupDeadline: Date.now() - 1, expiresAt: Date.now() + 60_000});
+      await expect(replica.renew()).rejects.toThrow(/termination/);
+      impl.storage.worktreeReplicaLeases.put({...lease, expiresAt: Date.now() + 60_000});
+      const exports = impl.ctx.exports as Cloudflare.Exports & {
+        IntegrationTestParticipant(options: {props: {name: string}}): Fetcher<IntegrationTestParticipant>;
+      };
+      await exports.IntegrationTestParticipant({props: {name}}).setFailure(false);
+      await impl.closeAgentIntegrationTurn(1, "completed");
+      await expect(replica.renew()).rejects.toThrow(/termination/);
+      await expect(replica.submitBatch({batchId: "after-ack", baseCursor: saved.cursor, files: []})).rejects.toThrow(/termination/);
+    });
+  });
+
+  it("does not poison the live barrier when concurrent identical no-op batches retry", () => inKernel(crypto.randomUUID(), async impl => {
+    const tree = await worktree(impl);
+    impl.addChatMessages(1, USER, [{type: "message", message: "Use the replica, then edit a file."}]);
+    await impl.beginAgentIntegrationTurn(1);
+    const faux = createFauxCore({models: [{id: "faux-model"}]});
+    faux.setResponses([async () => {
+      const endpoint = await open(impl), checkpoint = await endpoint.checkpoint();
+      const session = impl.getWorkspaceReplicaSession(checkpoint.cursor.split(":")[0]);
+      const host = session["host"], commit = host.commit;
+      let arrivals = 0, release!: () => void;
+      const barrier = new Promise<void>(resolve => { release = resolve; });
+      host.commit = async (...args) => {
+        if (++arrivals === 2) release();
+        await barrier;
+        return commit(...args);
+      };
+      const input = {batchId: "concurrent-noop", baseCursor: checkpoint.cursor, files: []};
+      const [one, two] = await Promise.all([session.submitBatch(input), session.submitBatch(input)]);
+      expect(one).toEqual(two);
+      expect([...impl.storage.worktreeReplicaCommits.list()]).toHaveLength(1);
+      return fauxAssistantMessage(fauxToolCall("writeFile", {workpiece: "REPO", filename: "a.txt", content: "later tool edit"}),
+        {stopReason: "toolUse"});
+    }, fauxAssistantMessage(fauxText("Done."))]);
+    await runAgent(impl, {model: faux.getModel(), stream: faux.stream}, 1, AUTHOR,
+      new AbortController().signal, USER, {provider: "cloudflare", model: "faux-model", apiToken: ""});
+    expect((await impl.getCurrentChatContent(1, impl.storage.chatMeta.get(1)!)).get(tree.id)?.get("a.txt"))
+      .toBe("later tool edit");
+    expect([...impl.storage.chats.list()].some(message => message.type === "message" && message.message === "Done.")).toBe(true);
+  }));
+
+  it("does not project an upload when message validation fails, including after retry and reset", async () => {
+    const name = crypto.randomUUID();
+    const saved = await inKernel(name, async impl => {
+      const user = env.TEST_USER.getByName(crypto.randomUUID());
+      const stage = (text: string, filename: string) => {
+        const id = crypto.randomUUID();
+        impl.storage.chatAttachmentContent.put({fileId: id, data: new TextEncoder().encode(text), state: {
+          type: "staged", uploadedAt: Date.now(), mimeType: "text/plain", name: filename,
+        }});
+        return {id};
+      };
+      const chatId = await impl.newChat(user, {profile: USER}, "Initial", undefined, [stage("initial", "initial.txt")]);
+      const treeId = impl.getChatAgentContext(chatId).attachments!.worktreeId;
+      const upload = stage("new content", "upload.txt");
+      const before = [...impl.storage.chats.list()];
+      for (let i = 0; i < 2; ++i) {
+        await expect(impl.sendChatMessage(user, {profile: USER}, chatId, "Read [0]", [{position: 5, length: 3,
+          gatekeeperId: 9999, description: {url: "test://missing", title: "Deleted", suggestedBindingName: "MISSING", tsType: "object"}}], [upload]))
+          .rejects.toThrow(/does not exist/);
+        expect(impl.storage.chatAttachmentContent.get(upload.id)?.state.type).toBe("staged");
+        expect([...impl.storage.chats.list()]).toEqual(before);
+        expect((await impl.getCurrentChatContent(chatId, impl.storage.chatMeta.get(chatId)!)).get(treeId)?.has("upload.txt")).toBeFalsy();
+        expect([...impl.storage.chatChanges.list()]).toEqual([]);
+      }
+      await impl.ctx.storage.sync();
+      return {chatId, treeId, upload};
+    });
+    await abortAllDurableObjects();
+    await inKernel(name, async impl => {
+      await impl.sendChatMessage(env.TEST_USER.getByName(crypto.randomUUID()), {profile: USER}, saved.chatId, "Read upload", undefined, [saved.upload]);
+      expect(impl.storage.chatAttachmentContent.get(saved.upload.id)?.state).toMatchObject({workspacePath: "upload.txt"});
+      expect((await impl.getCurrentChatContent(saved.chatId, impl.storage.chatMeta.get(saved.chatId)!)).get(saved.treeId)?.get("upload.txt"))
+        .toBe("new content");
+    });
+  });
+
   it.each(["edit", "set"])("pins a previously untouched gadget for a stored replica %s after suspension and reset", async mode => {
     const name = crypto.randomUUID();
     const saved = await inKernel(name, async impl => {

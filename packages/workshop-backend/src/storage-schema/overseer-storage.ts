@@ -77,6 +77,8 @@ export type WorktreeReplicaLease = {
   chatId: number;
   turnId: string;
   expiresAt: number;
+  /** Fixed terminal cleanup boundary; renewal cannot extend it or survive callback ACK. */
+  cleanupDeadline?: number;
   released?: boolean;
   /** Bootstrap authority is one-shot even if the replica remains live for synchronization. */
   gitBootstrapClosed?: boolean;

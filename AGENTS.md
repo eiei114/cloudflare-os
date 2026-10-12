@@ -17,6 +17,15 @@ This project is building a platform for "vibe coded" personal applications and A
   breadcrumbs. A created stream does not mean provider response headers have arrived.
 - Match terminal journals to the active continuation before skipping inference after reset. Model
   recovery failures must persist a terminal lifecycle outbox before removing the active record.
+- A persisted pause marker distinguishes interrupted suspension teardown from an authorized wake-up.
+  Recovery cancellation still needs idle bookkeeping, fenced against a newer live execution.
+- Bound replica correction receipts before the persistence barrier, not only incoming/accepted OTs:
+  a no-op against a stale cursor can require large canonical corrections.
+- Serialize replica receipt/version checks with live appends, so expected duplicate/CAS retries
+  never latch a fatal persistence error. Terminal replica cleanup is registered, ACK-fenced and
+  has a fixed durable deadline that renewal cannot extend.
+- Attachment projection must commit with its validated message. Prefetch bytes/tree metadata first;
+  a rejected send must leave uploads staged and must not consume a workspace filename.
 - Lifecycle callbacks retain registration-scoped worktree selections; never rebuild their authority
   from the latest bindings. Validate transforms before buffering, so malformed model edits become
   recorded tool errors rather than losing the whole step and its explanatory transcript.

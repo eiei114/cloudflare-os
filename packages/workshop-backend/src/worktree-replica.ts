@@ -158,6 +158,17 @@ export class WorktreeReplicaSession extends RpcTarget implements Pick<WorkspaceR
       }
       if (seen.size !== batch.files.length) throw new Error("Replica batch names an ungranted checkout.");
       if (codeChangeSerializedSize(change) > 1024 * 1024) throw new Error("Replica OT transaction exceeds its budget.");
+      // A tiny incoming OT can need large canonical corrections. Bound the durable receipt too,
+      // before entering the step barrier; a storage-size failure there would poison later writes.
+      // Reuse the conservative V8 OT estimate and allow ample framing for each receipt object.
+      const receiptBytes = 512 + 2 * (commitId.length + lease.id.length + digest.length +
+          receipt.batchId.length + receipt.committedAt.length) +
+        receipt.accepted.reduce((bytes, file) => bytes + 128 + 2 * (file.path.length + (file.hash?.length ?? 0)), 0) +
+        receipt.corrections.reduce((bytes, file) => bytes + 128 +
+          codeChangeSerializedSize({[file.checkoutId]: [[file.path, file.change]]}), 0);
+      if (receiptBytes > 1024 * 1024) {
+        throw new Error("Replica receipt exceeds its budget; consume canonical changes or submit fewer paths.");
+      }
       this.host.requireLease(this.leaseId);
       if (await this.host.commit(lease, version, change, { id: commitId, leaseId: lease.id, digest, receipt })) return receipt;
     }
