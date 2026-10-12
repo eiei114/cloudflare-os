@@ -27,6 +27,18 @@ Nested approvals use the existing action queue: durable submission does not gran
 Recoverable actions retain their origin and dispatch identity across resets rather than
 executing under a new user prompt.
 
+Lifecycle contexts retain their participant's registration-time worktree selection through retries
+and resumed segments; they never acquire later-added bindings implicitly. Replica reads may include
+gadgets a spawned agent can inspect, but replica writes obey that chat's ordinary file-tool rules:
+spawned agents may modify worktrees, not gadget code. Both live and stored ingestion enforce this.
+
+Active continuations persist the initiating request before asynchronous startup, and each published
+integration segment records its execution identity. Recovery skips inference for a completed segment
+only when its terminal journal belongs to that continuation; older cleanup cannot discard a new prompt.
+If model recovery fails, terminal callbacks are journalled before active state is cleared and the alarm
+retries failed cleanup. Malformed model transforms are rejected before buffering and logged with only
+stage/count diagnostics, preserving their tool-error transcript instead of aborting at persistence.
+
 ## Bootstrap and synchronization
 
 1. Acquire a revocable, expiring lease for the captured worktree selection.

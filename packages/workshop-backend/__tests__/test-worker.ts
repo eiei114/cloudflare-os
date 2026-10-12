@@ -114,7 +114,8 @@ export class FakeGatekeeperAccount
   }
 }
 
-const integrationCallbacks = new Map<string, { fail: boolean; calls: { event: AgentTurnEvent; turn: AgentTurnInfo }[] }>();
+const integrationCallbacks = new Map<string, { fail: boolean; captureReplica?: boolean;
+  calls: { event: AgentTurnEvent; turn: AgentTurnInfo; checkoutIds?: number[] }[] }>();
 
 /** A genuinely persistent native callback, so outbox tests cross RPC and DO storage boundaries. */
 export class IntegrationTestParticipant extends WorkerEntrypoint<unknown, { name: string }>
@@ -126,10 +127,17 @@ export class IntegrationTestParticipant extends WorkerEntrypoint<unknown, { name
   }
   async onAgentTurnEvent(event: AgentTurnEvent, context: RpcStub<AgentContext>): Promise<void> {
     using borrowed = context;
-    this.#state().calls.push({ event, turn: await borrowed.getTurn() });
+    const call = {event, turn: await borrowed.getTurn(), checkoutIds: undefined as number[] | undefined};
+    this.#state().calls.push(call);
     if (this.#state().fail) throw new Error("participant unavailable");
+    if (this.#state().captureReplica && call.turn.phase === "running") {
+      const replica = await borrowed.openWorktreeReplica();
+      try { call.checkoutIds = (await replica.checkpoint()).worktrees.map(tree => tree.checkoutId); }
+      finally { await replica.release(); }
+    }
   }
   setFailure(fail: boolean): void { this.#state().fail = fail; }
+  setCaptureReplica(capture: boolean): void { this.#state().captureReplica = capture; }
   calls() { return this.#state().calls; }
 }
 

@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { runInDurableObject } from "cloudflare:test";
+import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { OverseerDurableObject } from "../src/overseer";
 import type { IntegrationTestParticipant, IntegrationTestActionGatekeeper } from "./test-worker";
@@ -20,8 +20,7 @@ type TestExports = Cloudflare.Exports & {
 const GATEKEEPER = 31;
 const CHAT = 1;
 const CONFIG = '{"container":{"lifecycle":true,"contextualActions":true}}';
-async function inKernel(test: (impl: Impl, participant: Participant) => Promise<void>) {
-  const name = crypto.randomUUID();
+async function inKernel(test: (impl: Impl, participant: Participant) => Promise<void>, name = crypto.randomUUID()) {
   await runInDurableObject(env.TEST_OVERSEER.getByName(name), async instance => {
     const impl = instance["impl"];
     impl.env.AGENT_INTEGRATION_GRANTS = CONFIG;
@@ -63,6 +62,39 @@ const COMMAND: ActionDescription = { title: "Command", description: "Run pwd", i
 const APPROVER = { type: "user" as const, id: "approver", name: "Approver" };
 
 describe("agent integration over persistent native RPC", () => {
+  it("retains registration-scoped worktrees in started and resumed callbacks after eviction", async () => {
+    const name = crypto.randomUUID();
+    let checkoutId: number;
+    await inKernel(async (impl, participant) => {
+      impl.env.AGENT_INTEGRATION_GRANTS = '{"container":{"lifecycle":true,"worktreeReplica":true}}';
+      const timestamp = impl.getChatTimestamp();
+      impl.storage.chatMeta.put({id: CHAT, title: "Callbacks", started: timestamp, lastActive: timestamp});
+      const commit = await impl.gitStore.writeFilesAsCommit(new Map([["a.txt", "base"]]), {
+        parents: [], author: {name: "Test", email: "test@example.com"}, message: "Base", timestamp: new Date(0),
+      });
+      const tree = await impl.createWorktree("Repo", CHAT, commit);
+      checkoutId = tree.id;
+      impl.storage.chatContext.put({chatId: CHAT, bindings: {REPO: tree.id}});
+      impl.addChatMessages(CHAT, APPROVER, [{type: "message", message: "Work with REPO."}]);
+      await impl.beginAgentIntegrationTurn(CHAT);
+      await participant.setCaptureReplica(true);
+      await impl.registerIntegrationParticipant(GATEKEEPER, origin(impl), "running", participant);
+      await impl.closeAgentIntegrationTurn(CHAT, "approval");
+      const later = await impl.createWorktree("Later repo", CHAT, commit);
+      impl.storage.chatContext.put({chatId: CHAT, bindings: {REPO: tree.id, LATER: later.id}});
+      await impl.ctx.storage.sync();
+    }, name);
+    await evictDurableObject(env.TEST_OVERSEER.getByName(name));
+    await inKernel(async (impl, participant) => {
+      impl.env.AGENT_INTEGRATION_GRANTS = '{"container":{"lifecycle":true,"worktreeReplica":true}}';
+      await impl.beginAgentIntegrationTurn(CHAT);
+      const calls = (await participant.calls()).filter(call => call.checkoutIds !== undefined);
+      expect(calls.map(call => call.event.kind)).toEqual(["started", "resumed"]);
+      expect(calls.map(call => call.checkoutIds)).toEqual([[checkoutId], [checkoutId]]);
+      await impl.closeAgentIntegrationTurn(CHAT, "completed");
+    }, name);
+  });
+
   it("passes the real approval queue's context into a native gatekeeper session", async () => inKernel(async impl => {
     const handler = actionFacet(impl);
     try {

@@ -5,6 +5,8 @@ import type {OverseerDurableObject} from "../src/overseer";
 import type {UserDurableObject} from "../src/user";
 import {applyCodeChange, type CodeChange} from "@gadgets/workshop-shared/code-change";
 import {replicaTextHash} from "../src/workspace-replica";
+import {runAgent} from "../src/agent";
+import {createFauxCore, fauxAssistantMessage, fauxText, fauxToolCall} from "@earendil-works/pi-ai";
 
 declare module "cloudflare:workers" {
   interface ProvidedEnv {
@@ -50,6 +52,62 @@ async function open(impl: Impl, chatId = 1, gatekeeperId = 31) {
 }
 
 describe("replica review regressions over durable kernel storage", () => {
+  it.each(["set", "delete/recreate"])("preserves canonical %s replacement semantics against a concurrent edit", mode => inKernel(crypto.randomUUID(), async impl => {
+    const tree = await worktree(impl, 1, new Map([["a.txt", "one\ntwo\n"]]));
+    await impl.beginAgentIntegrationTurn(1);
+    const replica = await open(impl), checkpoint = await replica.checkpoint();
+    if (mode === "delete/recreate") await step(impl, 1, {[tree.id]: [["a.txt", {remove: true}]]});
+    await step(impl, 1, {[tree.id]: [["a.txt", {set: "ONE\ntwo\n"}]]});
+    const receipt = await replica.submitBatch({batchId: "replacement", baseCursor: checkpoint.cursor, files: [
+      {checkoutId: tree.id, path: "a.txt", baseHash: await replicaTextHash("one\ntwo\n"),
+        change: {edit: [4, [3, "TWO"], 1]}},
+    ]});
+    const content = await impl.getCurrentChatContent(1, impl.storage.chatMeta.get(1)!);
+    expect(content.get(tree.id)?.get("a.txt")).toBe("ONE\ntwo\n");
+    expect(receipt.accepted[0].hash).toBe(await replicaTextHash("ONE\ntwo\n"));
+  }));
+
+  it.each(["live", "stored"])("preserves spawned-chat write restrictions on the %s replica path", mode => inKernel(crypto.randomUUID(), async impl => {
+    const tree = await worktree(impl);
+    const commit = await impl.gitStore.writeFilesAsCommit(new Map([["a.txt", "safe"]]), {
+      parents: [], author: {name: "Test", email: "test@example.com"}, message: "Gadget", timestamp: new Date(0),
+    });
+    const gadgetId = 100;
+    impl.storage.gadgets.put({type: "gadget", id: gadgetId, title: "Read-only gadget",
+      bindingName: "SHARED", bindings: {}, created: new Date(0), commitId: commit});
+    impl.storage.chatContext.put({chatId: 1, bindings: {REPO: tree.id, SHARED: gadgetId},
+      alwaysAvailableCapsuleIds: [], spawnerConfig: {displayName: "Spawned", modelId: null, env: {}}});
+    impl.addChatMessages(1, USER, [{type: "message", message: "Work on the repo; the gadget is read-only."}]);
+    await impl.beginAgentIntegrationTurn(1);
+    const checkReplica = async () => {
+      const replica = await open(impl), checkpoint = await replica.checkpoint();
+      expect(checkpoint.worktrees.some(item => item.checkoutId === gadgetId)).toBe(true);
+      await expect((async () => { await replica.submitBatch({batchId: "forbidden", baseCursor: checkpoint.cursor, files: [
+        {checkoutId: gadgetId, path: "a.txt", baseHash: await replicaTextHash("safe"), change: {set: "hacked"}},
+      ]}); })()).rejects.toThrow(/permission to edit/);
+      expect([...impl.storage.worktreeReplicaCommits.list()]).toEqual([]);
+      await replica.submitBatch({batchId: "allowed", baseCursor: checkpoint.cursor, files: [
+        {checkoutId: tree.id, path: "a.txt", baseHash: await replicaTextHash("aaa"), change: {edit: [3, [0, "!"]]}},
+      ]});
+      const content = await impl.getCurrentChatContent(1, impl.storage.chatMeta.get(1)!);
+      expect(content.get(gadgetId)?.get("a.txt") ?? await impl.readFileAtCommit(commit, "a.txt")).toBe("safe");
+      expect(content.get(tree.id)?.get("a.txt")).toBe("aaa!");
+    };
+    if (mode === "stored") await checkReplica();
+    else {
+      const faux = createFauxCore({models: [{id: "faux-model"}]});
+      faux.setResponses([async () => {
+        await checkReplica();
+        return fauxAssistantMessage(fauxToolCall("writeFile", {workpiece: "SHARED", filename: "a.txt", content: "hacked"}),
+          {stopReason: "toolUse"});
+      }, fauxAssistantMessage(fauxText("Done."))]);
+      await runAgent(impl, {model: faux.getModel(), stream: faux.stream}, 1, AUTHOR,
+        new AbortController().signal, USER, {provider: "cloudflare", model: "faux-model", apiToken: ""});
+      const calls = [...impl.storage.chats.list()].flatMap(message => message.type === "message" ? message.toolCalls ?? [] : []);
+      expect(calls.find(call => call.toolName === "writeFile")?.error).toMatch(/permission to edit/);
+    }
+  }));
+
   it("keeps tiny accepted and pending edits as deltas across eviction", async () => {
     const name = crypto.randomUUID(), text = "a".repeat(400_000);
     const id = await inKernel(name, async impl => {

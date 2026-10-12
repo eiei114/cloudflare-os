@@ -44,7 +44,7 @@ import {
   getAiGatewayLogCost,
   type AiGatewayLogRoute,
 } from "./ai-gateway";
-import { AgentGadgetInfo, AgentHooks, CHAT_CHANGE_MESSAGE_BUDGET, SeedBindingInfo, formatMissingBlueprintBindings, runAgent, summarizeArgs, type AgentStepChange, type AiChatMessageBodyWithModelData, type ChatHistory, type WorktreeTurnAccess, GIT_BINDING_NAME } from "./agent";
+import { AgentGadgetInfo, AgentHooks, CHAT_CHANGE_MESSAGE_BUDGET, SeedBindingInfo, agentCodeChangeShape, assertAgentMayModifyWorkpiece, formatMissingBlueprintBindings, runAgent, summarizeArgs, type AgentStepChange, type AiChatMessageBodyWithModelData, type ChatHistory, type WorktreeTurnAccess, GIT_BINDING_NAME } from "./agent";
 import { WorktreeSessionImpl } from "./worktree-session";
 import { GitImpl } from "./git-binding";
 import { scanWorkpieceForGrep, type GrepScan } from "./grep";
@@ -1040,12 +1040,15 @@ class OverseerImpl implements AgentHooks {
   // by replaying the persisted chat log.
   async #resumeAgent(record: ActiveAgentRecord, liveChat: LiveChatContext) {
     if (!this.storage.activeAgents.get(record.chatId) || liveChat.cancelController.signal.aborted) return;
-    if (!record.continuationId) {
-      record = {...record, continuationId: crypto.randomUUID()};
+    if (!record.continuationId || record.requestKey === undefined) {
+      record = {...record, continuationId: record.continuationId ?? crypto.randomUUID(),
+        requestKey: record.requestKey ?? this.#agentRequestKey(record.chatId)};
       this.storage.activeAgents.put(record);
     }
     const closed = this.storage.agentIntegrationTurns.get(record.chatId);
-    if (closed?.state === "finished" && closed.closing?.kind === "finished") {
+    if (closed?.state === "finished" && closed.closing?.kind === "finished" &&
+        (closed.continuationId !== undefined ? closed.continuationId === record.continuationId
+          : closed.requestKey === record.requestKey)) {
       // The model finished before reset, but teardown had not removed activeAgents.
       // Drain its durable cleanup outbox rather than infer again for a completed prompt.
       try { await this.closeAgentIntegrationTurn(record.chatId, closed.closing.reason); }
@@ -1096,6 +1099,11 @@ class OverseerImpl implements AgentHooks {
       this.postAgentErrorMessage(record.chatId, record.initiator,
           "Agent interrupted due to server restart and could not be resumed because its AI " +
           "model is no longer available.");
+      try { await this.closeAgentIntegrationTurn(record.chatId, "failed"); }
+      catch (error) {
+        if (isDoResetError(error)) { this.#deferAgentResume(record, liveChat); return; }
+        this.logger.warn("interrupted agent cleanup deferred", {event: "agent.resume.cleanup.deferred", error});
+      }
       let meta = this.storage.chatMeta.get(record.chatId);
       if (meta) {
         delete meta.activeAgent;
@@ -2774,8 +2782,17 @@ class OverseerImpl implements AgentHooks {
     let meta = this.storage.chatMeta.get(chatId);
     if (!meta) return false;  // chat deleted mid-turn
 
-    for (let {change} of step.changes) {
-      validateCodeChangeSchema(change);
+    for (const [changeIndex, {change}] of step.changes.entries()) {
+      try { validateCodeChangeSchema(change); }
+      catch (error) {
+        this.logger.error("invalid agent transform rejected at persistence", {
+          event: "agent.step.change.invalid", chatId, changeStage: "persist", changeIndex, ...agentCodeChangeShape(change),
+        });
+        throw error;
+      }
+      if (step.replicaCommit) for (const id of changedGadgets(change)) {
+        assertAgentMayModifyWorkpiece(this.getChatAgentContext(chatId), this.isWorktree(id));
+      }
     }
 
     // The worktrees this step pins: every worktree of this chat its rows or commits touch that
@@ -6597,6 +6614,7 @@ class OverseerImpl implements AgentHooks {
     if (!this.storage.agentIntegrationParticipants.get(id)) {
       this.storage.agentIntegrationParticipants.put({ id, gatekeeperId, participant,
         turnId: origin.turnId, chatId: origin.chatId,
+        worktrees: origin.worktrees,
         pending: turn.closing ? [turn.entry, turn.closing] : [turn.entry],
         retryAt: Date.now() + 30_000 });
       this.#updateAlarm();
@@ -6629,6 +6647,7 @@ class OverseerImpl implements AgentHooks {
             await deliverIntegrationEvent(() => record.participant.onAgentTurnEvent(event,
               new AgentContextImpl(this, record.gatekeeperId, {
                 chatId: record.chatId, turnId: event.turnId, segmentId: event.segmentId,
+                worktrees: record.worktrees,
               }, phase)));
           }
         } catch (error) {
@@ -6684,12 +6703,15 @@ class OverseerImpl implements AgentHooks {
       .map(record => this.#deliverIntegrationParticipant(record.id)));
   }
 
-  async beginAgentIntegrationTurn(chatId: number): Promise<void> {
-    if (!this.env.AGENT_INTEGRATION_GRANTS) return;
+  #agentRequestKey(chatId: number): string {
     const request = [...this.storage.chats.list({ prefix: `${keyString(chatId)}.`, reverse: true })]
       .find(message => message.type === "agentCallback" ||
         message.type === "message" && message.author.type !== "agent");
-    const requestKey = String(request?.sequence ?? this.nextChatSequencePeek(chatId));
+    return String(request?.sequence ?? this.nextChatSequencePeek(chatId));
+  }
+
+  async beginAgentIntegrationTurn(chatId: number, requestKey = this.#agentRequestKey(chatId)): Promise<void> {
+    if (!this.env.AGENT_INTEGRATION_GRANTS) return;
     let previous = this.storage.agentIntegrationTurns.get(chatId);
     if (previous && previous.state !== "finished" && previous.requestKey !== requestKey) {
       // Superseding a paused prompt terminates it; its suspended event has already been delivered.
@@ -6703,6 +6725,7 @@ class OverseerImpl implements AgentHooks {
         .map(record => this.#deliverIntegrationParticipant(record.id)));
     }
     const next = beginIntegrationTurn(previous, chatId, requestKey);
+    next.continuationId = this.storage.activeAgents.get(chatId)?.continuationId;
     const participants = [...this.storage.agentIntegrationParticipants.byTurn.get(next.turnId)];
     this.storage.transaction(() => {
       this.storage.agentIntegrationTurns.put(next);
@@ -7484,6 +7507,7 @@ class OverseerImpl implements AgentHooks {
       initiator,
       callbackInitiated,
       continuationId,
+      requestKey: this.#agentRequestKey(chatId),
     });
 
     let liveChat = this.#getLiveChat(chatId);
@@ -7532,7 +7556,7 @@ class OverseerImpl implements AgentHooks {
     });
 
     try {
-      await this.beginAgentIntegrationTurn(chatId);
+      await this.beginAgentIntegrationTurn(chatId, this.storage.activeAgents.get(chatId)?.requestKey);
       // An explicit shutdown fences re-entry only for the remainder of the turn that requested
       // it. Starting a later turn for this chat clears that latch while retaining its snapshot.
 

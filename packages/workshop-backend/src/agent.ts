@@ -1,5 +1,5 @@
 import { AiChatMessage, AiChatAuthorInfo, AiToolCall, AiChatMessageBody, AiChatStreamEvent, BlueprintBinding, BlueprintMerge, BlueprintOutput, ChatGadgetPin, ChatGadgetPinRecord, MainlineMergeGadget, WorkpieceId, type AiModelConfig, isTextLikeAttachmentMimeType, validateBindingName } from '@gadgets/workshop-shared/api';
-import { applyCodeChange, codeChangeSerializedSize, replaceSpanChange, type CodeContent,
+import { applyCodeChange, codeChangeSerializedSize, replaceSpanChange, validateCodeChangeSchema, type CodeContent,
   type CodeChange, type FileChange } from '@gadgets/workshop-shared/code-change';
 import { PDF_MIME_TYPE, modelApiSupportsPdfAttachments } from './chat-attachment-pdf';
 import { AgentCatalog, ObservationDescription } from '@gadgets/workshop-shared/gatekeeper';
@@ -38,6 +38,25 @@ import { formatGrep, type GrepScan } from "./grep";
 import type { WorktreeReplicaCommit } from "./worktree-replica";
 
 const logger = createWorkshopLogger("workshop.agent");
+
+/** Apply the same spawned-agent write restriction to file tools and replica ingestion. */
+export function assertAgentMayModifyWorkpiece(context: AiChatAgentContext, isWorktree: boolean): void {
+  if (context.spawnerConfig && !isWorktree) {
+    throw new Error("You do not have permission to edit this gadget's code.");
+  }
+}
+
+/** Content-free counters for rejected transforms; diagnostics must contain no paths or text. */
+export function agentCodeChangeShape(change: CodeChange) {
+  const shape = {changeWorkpieceCount: Object.keys(change).length, changeFileCount: 0, changeEmptyPathCount: 0};
+  for (const entries of Object.values(change)) if (Array.isArray(entries)) {
+    for (const entry of entries) if (Array.isArray(entry)) {
+      ++shape.changeFileCount;
+      if (entry[0] === "") ++shape.changeEmptyPathCount;
+    }
+  }
+  return shape;
+}
 
 /**
  * Byte bound on one "changes" message's composed change for the *user* edit path.
@@ -2056,9 +2075,7 @@ async function runAgentPass(
   // Refuses a file-tool write the chat may not make: a spawned agent runs with no user present to
   // review changes, so it may modify only worktrees, never a gadget's code.
   let assertMayModifyWorkpiece = (workpieceId: WorkpieceId) => {
-    if (agentContext.spawnerConfig && !hooks.isWorktree(workpieceId)) {
-      throw new Error("You do not have permission to edit this gadget's code.");
-    }
+    assertAgentMayModifyWorkpiece(agentContext, hooks.isWorktree(workpieceId));
   };
 
   // Always-available resources (e.g. the Context Library) describe the agent's environment, so
@@ -2863,6 +2880,13 @@ async function runAgentPass(
   let appendAgentEdit = (
       workpieceId: WorkpieceId, change: CodeChange,
       pin?: {baseCommit: string, baseFiles: Map<string, string>}) => {
+    try { validateCodeChangeSchema(change); }
+    catch (error) {
+      logger.warn("invalid agent transform rejected before buffering", {
+        event: "agent.step.change.invalid", chatId, changeStage: "buffer", ...agentCodeChangeShape(change),
+      });
+      throw error;
+    }
     // Bound the step's total: the barrier writes the buffer as exactly one "changes" message,
     // which must fit in one storage record. The failed call buffers nothing -- everything
     // buffered before it persists normally at the barrier -- and the error tells the model how
@@ -2896,8 +2920,15 @@ async function runAgentPass(
       pin?: {baseCommit: string, baseFiles: Map<string, string>}}[] = [];
     for (let [key, entries] of Object.entries(change)) {
       let workpieceId = Number(key);
+      assertMayModifyWorkpiece(workpieceId);
       let pin: {baseCommit: string, baseFiles: Map<string, string>} | undefined;
-      if (!pinnedGadgets.has(workpieceId) && !hooks.isWorktree(workpieceId)) {
+      if (hooks.isWorktree(workpieceId)) {
+        // A replica can edit a file no DO tool has read. Fault only the touched edit bases,
+        // using the same lazy, tombstone-aware read path as ordinary file operations.
+        for (const [path, fileChange] of entries) if ("edit" in fileChange) {
+          await readWorktreeBase(workpieceId, path);
+        }
+      } else if (!pinnedGadgets.has(workpieceId)) {
         let head = hooks.getGadgetHead(workpieceId);
         if (head !== undefined) {
           pin = {baseCommit: head, baseFiles: await hooks.readCommitFiles(head)};

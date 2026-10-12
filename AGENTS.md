@@ -7,12 +7,24 @@ This project is building a platform for "vibe coded" personal applications and A
   repeated text can give the same bytes a different insertion position and change collision results.
 - Preserve composed deltas across accepts/compaction and retain anchor history for live replica leases.
   Test actual operation sequences and compact wire/storage size, not only final file contents.
+- Replica ingestion must enforce the originating chat's file-tool permissions, including spawned
+  agents' gadget-write prohibition, on both live and stored paths. Fault only touched edit bases.
+- Match terminal journals to the active continuation before skipping inference after reset. Model
+  recovery failures must persist a terminal lifecycle outbox before removing the active record.
+- Lifecycle callbacks retain registration-scoped worktree selections; never rebuild their authority
+  from the latest bindings. Validate transforms before buffering, so malformed model edits become
+  recorded tool errors rather than losing the whole step and its explanatory transcript.
 - Approval concurrency tests must release their effect barrier before awaiting joined approvals;
   otherwise a test can deadlock against correct single-flight behavior.
 - Match the Node version pinned in CI when diagnosing test failures. A newer Node major can shadow
   jsdom's `localStorage`; excessive parallel workerd fleets can also cause exit 137 locally.
+- On this Mac, check power logs when unrelated suites expire together: system sleep advances
+  watchdog deadlines. Use a test-scoped `caffeinate -i` when needed; do not disable screen locking.
+  Thermal-emergency sleep can override it; reduce test concurrency rather than bypassing thermal safety.
 - Verify newly added regressions actually execute with direct Vitest or `vp run --no-cache`;
   a successful cached run can replay an older test count, especially for untracked test files.
+- To select backend unit files, invoke Vitest directly after codegen: arguments to the compound
+  `test:run` script reach only its final integration-suite command, not its first unit-suite command.
 
 ## Durable Object reset discipline
 
