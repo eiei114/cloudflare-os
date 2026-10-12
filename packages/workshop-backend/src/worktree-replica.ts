@@ -1,34 +1,15 @@
 import { RpcTarget } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
 import type { Cursor } from "@gadgets/workshop-shared/gatekeeper";
-import type { WorktreeBase, WorktreeBaseEntry, WorktreeChange, WorktreeChangesPage,
+import type { WorktreeBaseEntry, WorktreeChange, WorktreeChangesPage,
   WorktreeReplicaBatch, WorktreeReplicaReceipt, WorkspaceCheckpoint, WorkspaceReplica }
   from "@gadgets/workshop-shared/agent-integration";
 import { applyCodeChange, composeCodeChange, codeChangeSerializedSize, type CodeChange }
   from "@gadgets/workshop-shared/code-change";
 import { mergeReplicaBatch, replicaTextHash, type ReplicaBatch } from "./workspace-replica";
 
-/** Persisted checkpoint and lease; IDs are bearer capabilities, not workspace lookup keys. */
-export type WorktreeReplicaLease = {
-  id: string;
-  gatekeeperId: number;
-  chatId: number;
-  turnId: string;
-  expiresAt: number;
-  released?: boolean;
-  /** Bootstrap authority is one-shot even if the replica remains live for synchronization. */
-  gitBootstrapClosed?: boolean;
-  worktrees: WorktreeBase[];
-  checkpoint?: WorkspaceCheckpoint & { overlay: WorktreeChange[] };
-};
-
-/** Written in the same transaction as canonical OTs, never in a subsequent RPC. */
-export type WorktreeReplicaCommit = {
-  id: string;
-  leaseId: string;
-  digest: string;
-  receipt: WorktreeReplicaReceipt;
-};
+import type { WorktreeReplicaLease, WorktreeReplicaCommit } from "./storage-schema/overseer-storage";
+export type { WorktreeReplicaLease, WorktreeReplicaCommit } from "./storage-schema/overseer-storage";
 
 /** Kernel storage/OT plumbing, not a parallel RPC interface. */
 export interface WorktreeReplicaHost {

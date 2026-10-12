@@ -1,7 +1,8 @@
 import { env } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { OverseerDurableObject, ActionRecord } from "../src/overseer";
+import type { OverseerDurableObject } from "../src/overseer";
+import type { ActionRecord } from "../src/storage-schema/overseer-storage";
 import type { IntegrationTestActionGatekeeper } from "./test-worker";
 
 declare module "cloudflare:workers" {
@@ -18,7 +19,7 @@ function facet(impl: Impl) {
   const handler = impl.ctx.facets.get<IntegrationTestActionGatekeeper>("recovery-actions", () => ({
     class: (impl.ctx.exports as TestExports).IntegrationTestActionGatekeeper({ props: {} }),
   }));
-  impl.getGatekeeperFacet = () => handler;
+  impl.getGatekeeperFacet = async () => handler;
   return handler;
 }
 function action(impl: Impl): ActionRecord & { type: "action" } {
@@ -128,7 +129,7 @@ describe("durable approved-action recovery", () => {
     const stub = env.TEST_OVERSEER.getByName(crypto.randomUUID());
     await runInDurableObject(stub, async instance => {
       const impl = instance.impl, handler = await prepare(impl);
-      impl.getGatekeeperFacet = () => new Proxy(handler, { get(target, key) {
+      impl.getGatekeeperFacet = async () => new Proxy(handler, { get(target, key) {
         if (key === "applyActionInContext") return async (...args: Parameters<typeof target.applyActionInContext>) => {
           // Intent was persisted before crossing into a real, persistent native facet.
           expect([...impl.storage.actionApplications.list()]).toHaveLength(1);
@@ -201,7 +202,7 @@ describe("durable approved-action recovery", () => {
     await runInDurableObject(env.TEST_OVERSEER.getByName(crypto.randomUUID()), async instance => {
       const impl = instance.impl, handler = await prepare(impl, mode !== "legacy");
       try {
-        impl.getGatekeeperFacet = () => new Proxy(handler, { get(target, key) {
+        impl.getGatekeeperFacet = async () => new Proxy(handler, { get(target, key) {
           if (key === "applyActionInContext") return async () => { throw reset(); };
           return Reflect.get(target, key);
         }});

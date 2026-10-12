@@ -3,7 +3,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { OverseerDurableObject } from "../src/overseer";
 import type { IntegrationTestParticipant, IntegrationTestActionGatekeeper } from "./test-worker";
-import type { ActionRecord } from "../src/overseer";
+import type { ActionRecord } from "../src/storage-schema/overseer-storage";
 import type { ActionDescription } from "@gadgets/workshop-shared/gatekeeper";
 
 declare module "cloudflare:workers" {
@@ -56,7 +56,7 @@ function actionFacet(impl: Impl) {
   const facet = impl.ctx.facets.get<IntegrationTestActionGatekeeper>("integration-actions", () => ({
     class: (impl.ctx.exports as TestExports).IntegrationTestActionGatekeeper({ props: {} }),
   }));
-  impl.getGatekeeperFacet = () => facet;
+  impl.getGatekeeperFacet = async () => facet;
   return { facet, restore() { impl.getGatekeeperFacet = original; } };
 }
 const COMMAND: ActionDescription = { title: "Command", description: "Run pwd", implementsRevert: false };

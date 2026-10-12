@@ -9,13 +9,15 @@ import { WorktreeReplicaSession, type WorktreeReplicaHost, type WorktreeReplicaL
 import { workspaceCollisionCases } from "./workspace-collision-cases";
 import { replicaTextHash } from "../src/workspace-replica";
 import type { IntegrationTestActionGatekeeper } from "./test-worker";
+import { foldCompactedCode } from "../src/agent-compaction";
 
 declare module "cloudflare:workers" {
   interface ProvidedEnv { TEST_OVERSEER: DurableObjectNamespace<OverseerDurableObject>; }
 }
 
 describe("kernel replica capability over native RPC", () => {
-  it.each([false, true])("keeps the remote base across accepts, with pending edits: %s", async pending => {
+  it.each([[false, false], [true, false], [true, true]])(
+    "keeps the remote base across accepts, with pending edits %s and compaction %s", async (pending, compact) => {
     await runInDurableObject(env.TEST_OVERSEER.getByName(crypto.randomUUID()), async instance => {
       const impl = instance["impl"];
       impl.env.AGENT_INTEGRATION_GRANTS = '{"container":{"worktreeReplica":true}}';
@@ -36,7 +38,7 @@ describe("kernel replica capability over native RPC", () => {
         impl.storage.chatContext.put({chatId: 1, bindings: {REPO: tree.id}});
         const step = async (change: CodeChange, created = false) => impl.commitAgentStep(1,
           {type: "agent", id: "test", name: "Test"}, [], {
-            changes: [{change}], createdGadgets: [], addedBindings: [], worktreeCommits: [],
+            changes: [{change}], createdGadgets: [], addedBindings: [], worktreeCommits: [], blueprintMerges: [],
             createdWorktrees: created ? [{worktreeId: tree.id, title: tree.title, bindingName: "REPO"}] : [],
           });
         await step({[tree.id]: [["a.txt", {set: "accepted\n"}], ["new.txt", {set: "accepted new\n"}],
@@ -50,6 +52,15 @@ describe("kernel replica capability over native RPC", () => {
         expect(impl.storage.gitObjectMetadata.get(accepted.pinBase)?.onRemote ?? []).toEqual([]);
         if (pending) await step(diffFiles(new Map([[tree.id, new Map([["a.txt", "accepted\n"]])]]),
           new Map([[tree.id, new Map([["a.txt", "accepted\npending\n"]])]])));
+        if (compact) {
+          const history = impl.loadChatHistory(1);
+          const compactedTo = Math.max(...history.chatMessages.map(message => message.sequence)) + 1;
+          impl.commitChatCompaction(1, {
+            chatId: 1, compactedTo, summary: "Retain the pending edit", chatBindings: [],
+            nextChangeId: 1, ...foldCompactedCode(history.chatMessages, compactedTo, undefined),
+          });
+          expect(impl.loadChatHistory(1).chatMessages).toEqual([]);
+        }
         await impl.beginAgentIntegrationTurn(1);
         const origin = impl.captureIntegrationOrigin({from: "agent", chatId: 1})!;
         const replica = await impl.getIntegrationContext(31, origin)!.openWorktreeReplica();

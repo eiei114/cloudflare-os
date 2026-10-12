@@ -1,7 +1,7 @@
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionLogEntry, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, ChatGadgetPinRecord, MainlineMergeGadget, ChatCodeBase, ChatGadgetPinState, CodeChangeSubmission, CommitInfo, FileAtCommit, MAX_READ_FILES_PER_CALL, TreeNode, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiToolCall, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, BlueprintMerge, ApplyBlueprintResult, GadgetUpstream, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName, isTextLikeAttachmentMimeType } from '@gadgets/workshop-shared/api'
-import { applyCodeChange, changedGadgets, codeChangeSerializedSize, composeCodeChange, diffFiles,
+import { applyCodeChange, changedGadgets, codeChangeSerializedSize, composeCodeChange,
   transformCodeChange, validateCodeChangeContent, validateCodeChangeSchema,
   type CodeContent, type CodeChange } from "@gadgets/workshop-shared/code-change";
 import { type AgentCatalog, Gatekeeper, GatekeeperUserVerifier, HookInitiator, ResourceDescription, ApprovalQueue, ActionDescription, ObservationAuthorizer, ObservationDescription, VendorDescription, SupportedResource, resolveRequestedResource, HookController, HookDescription, ActionKind, GitCache, GitPullHints } from "@gadgets/workshop-shared/gatekeeper";
@@ -20,7 +20,7 @@ import {
   type ExternalChatRecord, type ExternalMessageRecord, type GadgetRecord, type GatekeeperCaller,
   type GatekeeperClass, type GatekeeperRecord, type ObserverRecord, type OverseerStorage,
   type StoredAssistantMessage, type StoredChatMessage, type StoredChatMetadata,
-  type WorkpieceRecord, type WorktreeRecord, type WorkspaceRepositoryRecord, type WorkspaceCheckoutRecord,
+  type WorkpieceRecord, type WorktreeRecord, type WorkspaceCheckoutRecord,
 } from "./storage-schema/overseer-storage";
 import type { UserAiModelRecord, WorkspaceOutputEntry } from "./storage-schema/user-storage";
 import {
@@ -70,8 +70,7 @@ import { WorktreeReplicaSession, requireReplicaPath, type WorktreeReplicaHost,
   type WorktreeReplicaLease, type WorktreeReplicaCommit } from "./worktree-replica";
 import type { Cursor } from "@gadgets/workshop-shared/gatekeeper";
 import { agentIntegrationGrant, beginIntegrationTurn, closeIntegrationTurn, requireIntegrationTurn,
-  deliverIntegrationEvent, type AgentIntegrationOrigin, type AgentIntegrationTurn,
-  type AgentIntegrationParticipantRecord } from "./agent-integration";
+  deliverIntegrationEvent, type AgentIntegrationOrigin } from "./agent-integration";
 import { WebFetchEnv } from "./web-fetch";
 import { UserDurableObject, type UserChatContext } from "./user";
 import type { AgentSpawnerBinding, CallableAgent, SpawnCallableOptions } from "./agent-spawner-binding";
@@ -256,8 +255,6 @@ type PreparedAttachmentsWorktree = {
   bindingName: string;
 };
 
-// A call made on a callable agent (the `self` object or a spawnCallable() stub) that has not yet
-// been appended to its chat log. See the `pendingAgentCalls` collection.
 // getAgentCatalog is optional on Gatekeeper; ambient capsules always implement it. After confirming
 // the gatekeeper is an ambient capsule, we view its facet through this derived (Pick + Required)
 // shape to call it — same optional-method-on-a-stub pattern as user.ts's SingletonAccountStub.
@@ -1073,7 +1070,7 @@ class OverseerImpl implements AgentHooks {
         const action = this.storage.actions.get(application.id);
         if (action?.type === "action" && action.caller.from === "agent" &&
             action.caller.chatId === record.chatId && action.state === "pending") {
-          await this.applyPendingAction(action, application.resolvedBy, application.autoApproved, application.resumeUserId);
+          await this.applyPendingAction(action, application.resolvedBy, application.autoApproved, undefined, application.resumeUserId);
         }
       }
       let userMeta = await retryOnDoReset(() =>
@@ -5004,7 +5001,7 @@ class OverseerImpl implements AgentHooks {
             this.storage.actionApplications.delete(application.id);
             throw new Error("Automatic action recovery permission was revoked.");
           }
-          await this.applyPendingAction(record, application.resolvedBy, application.autoApproved, application.resumeUserId);
+          await this.applyPendingAction(record, application.resolvedBy, application.autoApproved, undefined, application.resumeUserId);
         }
       } catch (error) {
         const latest = this.storage.actionApplications.get(application.id);
@@ -6499,8 +6496,8 @@ class OverseerImpl implements AgentHooks {
       return (await this.gitCache.ensureObject(entry.oid, { type: "blob", referencedBy: entry.referencedBy })).payload;
     };
     const overlay = (lease: WorktreeReplicaLease): CodeChange => {
-      let result: CodeChange = {};
-      for (const batch of this.getProposedChanges(lease.chatId)) if (batch.change) result = composeCodeChange(result, batch.change);
+      const history = this.loadChatHistory(lease.chatId);
+      let result = foldCompactedCode(history.chatMessages, Infinity, history.checkpoint).proposedChange ?? {};
       const meta = this.storage.chatMeta.get(lease.chatId)!;
       for (const row of this.listLiveChatChanges(lease.chatId, this.chatCodeBase(meta).generation)) {
         result = composeCodeChange(result, row.change);
@@ -7724,8 +7721,7 @@ class OverseerImpl implements AgentHooks {
         // Reap any provisional gadget this turn created whose creating step never reached its
         // barrier (the turn erred or was aborted mid-step): the record is unstamped and the
         // step's message is by construction lost, so nothing in the log backs it. Never throws,
-        // so it can't mask an error propagating out of the turn. Ownership must be back in the DO
-        // first because a reap changes the set of materializable checkouts.
+        // so it can't mask an error propagating out of the turn.
         await this.reconcilePendingGadgets(chatId);
 
         // Note: We no longer emit a stream "clear" event here. The client performs a full clear of

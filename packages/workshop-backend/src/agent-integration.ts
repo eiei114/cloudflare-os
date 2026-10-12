@@ -1,4 +1,6 @@
-import type { AgentTurnEvent, AgentTurnInfo, AgentTurnParticipant } from "@gadgets/workshop-shared/agent-integration";
+import type { AgentTurnEvent, AgentTurnInfo } from "@gadgets/workshop-shared/agent-integration";
+import type { AgentIntegrationOrigin, AgentIntegrationTurn } from "./storage-schema/overseer-storage";
+export type { AgentIntegrationOrigin, AgentIntegrationTurn, AgentIntegrationParticipantRecord } from "./storage-schema/overseer-storage";
 
 /** Trusted deployment grants; none can be asserted by a gatekeeper's description. */
 export type AgentIntegrationGrant = {
@@ -32,34 +34,6 @@ export function agentIntegrationGrant(config: string | undefined, vendorId: stri
     return {};
   }
 }
-
-/** Durable logical-turn identity, independent of the invocation that happens to execute it. */
-export type AgentIntegrationTurn = {
-  chatId: number;
-  requestKey: string;
-  turnId: string;
-  segmentId: string;
-  state: "running" | "suspended" | "finished";
-  entry: AgentTurnEvent;
-  closing?: AgentTurnEvent;
-};
-
-/** Queue-time origin captured by a context or action; never resolves against a later turn. */
-export type AgentIntegrationOrigin = Pick<AgentIntegrationTurn, "chatId" | "turnId" | "segmentId"> & {
-  /** Queue-time selection; approval cannot acquire later-added mounts. */
-  worktrees?: import("@gadgets/workshop-shared/agent-integration").WorktreeBase[];
-};
-
-/** Persistent callback and outbox, scoped to one binding and one logical turn. */
-export type AgentIntegrationParticipantRecord = {
-  id: string;
-  gatekeeperId: number;
-  turnId: string;
-  chatId: number;
-  participant: Fetcher<AgentTurnParticipant>;
-  pending: AgentTurnEvent[];
-  retryAt?: number;
-};
 
 /** Start/resume transition. Same request resumes only while its logical turn remains unfinished. */
 export function beginIntegrationTurn(previous: AgentIntegrationTurn | undefined, chatId: number,

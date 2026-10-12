@@ -34,9 +34,59 @@ import type {
 } from "@gadgets/workshop-shared/gatekeeper";
 import type { SpawnCallableOptions } from "../agent-spawner-binding";
 import type {
-  AgentIntegrationOrigin, AgentIntegrationTurn, AgentIntegrationParticipantRecord,
-} from "../agent-integration";
-import type { WorktreeReplicaLease, WorktreeReplicaCommit } from "../worktree-replica";
+  AgentTurnEvent, AgentTurnParticipant, WorktreeBase, WorktreeChange,
+  WorktreeReplicaReceipt, WorkspaceCheckpoint,
+} from "@gadgets/workshop-shared/agent-integration";
+
+/** Durable logical-turn identity, independent of the invocation that happens to execute it. */
+export type AgentIntegrationTurn = {
+  chatId: number;
+  requestKey: string;
+  turnId: string;
+  segmentId: string;
+  state: "running" | "suspended" | "finished";
+  entry: AgentTurnEvent;
+  closing?: AgentTurnEvent;
+};
+
+/** Queue-time origin captured by a context or action; never resolves against a later turn. */
+export type AgentIntegrationOrigin = Pick<AgentIntegrationTurn, "chatId" | "turnId" | "segmentId"> & {
+  /** Queue-time selection; approval cannot acquire later-added mounts. */
+  worktrees?: WorktreeBase[];
+};
+
+/** Persistent callback and outbox, scoped to one binding and one logical turn. */
+export type AgentIntegrationParticipantRecord = {
+  id: string;
+  gatekeeperId: number;
+  turnId: string;
+  chatId: number;
+  participant: Fetcher<AgentTurnParticipant>;
+  pending: AgentTurnEvent[];
+  retryAt?: number;
+};
+
+/** Persisted checkpoint and lease; IDs are bearer capabilities, not workspace lookup keys. */
+export type WorktreeReplicaLease = {
+  id: string;
+  gatekeeperId: number;
+  chatId: number;
+  turnId: string;
+  expiresAt: number;
+  released?: boolean;
+  /** Bootstrap authority is one-shot even if the replica remains live for synchronization. */
+  gitBootstrapClosed?: boolean;
+  worktrees: WorktreeBase[];
+  checkpoint?: WorkspaceCheckpoint & { overlay: WorktreeChange[] };
+};
+
+/** Written in the same transaction as canonical OTs, never in a subsequent RPC. */
+export type WorktreeReplicaCommit = {
+  id: string;
+  leaseId: string;
+  digest: string;
+  receipt: WorktreeReplicaReceipt;
+};
 
 // =======================================================================================
 // Workpieces
@@ -1255,26 +1305,29 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
     collections: {
       workspaceRepositories: collection<WorkspaceRepositoryRecord>()({
         primaryKey: "id",
-        nonUniqueIndexes: {bySourceGatekeeper: record => record.sourceGatekeeperId ?? null},
+        nonUniqueIndexes: {bySourceGatekeeper: (record: WorkspaceRepositoryRecord) => record.sourceGatekeeperId ?? null},
       }),
       workspaceCheckouts: collection<WorkspaceCheckoutRecord>()({
         primaryKey: "workpieceId",
-        uniqueIndexes: {byMountName: record => record.mountName},
+        uniqueIndexes: {byMountName: (record: WorkspaceCheckoutRecord) => record.mountName},
       }),
       pausedAgents: collection<ActiveAgentRecord>()({primaryKey: "chatId"}),
       actionApplications: collection<ActionApplication>()({
         primaryKey: "id",
-        nonUniqueIndexes: {retryAt: record => record.retryAt},
+        nonUniqueIndexes: {retryAt: (record: ActionApplication) => record.retryAt},
       }),
       agentIntegrationTurns: collection<AgentIntegrationTurn>()({primaryKey: "chatId"}),
       worktreeReplicaLeases: collection<WorktreeReplicaLease>()({primaryKey: "id"}),
       worktreeReplicaCommits: collection<WorktreeReplicaCommit>()({
         primaryKey: "id",
-        nonUniqueIndexes: {byLease: record => record.leaseId},
+        nonUniqueIndexes: {byLease: (record: WorktreeReplicaCommit) => record.leaseId},
       }),
       agentIntegrationParticipants: collection<AgentIntegrationParticipantRecord>()({
         primaryKey: "id",
-        nonUniqueIndexes: {byTurn: record => record.turnId, retryAt: record => record.retryAt ?? null},
+        nonUniqueIndexes: {
+          byTurn: (record: AgentIntegrationParticipantRecord) => record.turnId,
+          retryAt: (record: AgentIntegrationParticipantRecord) => record.retryAt ?? null,
+        },
       }),
       // READ-ONLY LEGACY: the pre-git-storage incremental code log, tightly-packed from version 1
       // (there's no entry for version 0, the starting empty state). Nothing writes it anymore --
