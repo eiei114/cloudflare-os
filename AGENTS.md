@@ -9,6 +9,12 @@ This project is building a platform for "vibe coded" personal applications and A
   Test actual operation sequences and compact wire/storage size, not only final file contents.
 - Replica ingestion must enforce the originating chat's file-tool permissions, including spawned
   agents' gadget-write prohibition, on both live and stored paths. Fault only touched edit bases.
+- First-write gadget pins must also be prepared on the stored replica path after approval/eviction,
+  against the lease's immutable base; verify that the resulting proposal can actually be accepted.
+- Text attachment projection must obey the OT text limit, not only the upload byte limit. Reserve
+  existing base/accepted/pending root names using metadata so uploads never replace workspace work.
+- Diagnose agent stalls with content-free queued/started/completed barrier and model-dispatch
+  breadcrumbs. A created stream does not mean provider response headers have arrived.
 - Match terminal journals to the active continuation before skipping inference after reset. Model
   recovery failures must persist a terminal lifecycle outbox before removing the active record.
 - Lifecycle callbacks retain registration-scoped worktree selections; never rebuild their authority
@@ -42,6 +48,8 @@ operating condition for every feature, not just a deployment event.
   checkpoint results before releasing leases or destroying external resources.
 - Persistent capabilities must be minted by the DO invocation that stores them. Test-pool
   wrappers and another DO's I/O handles cannot substitute for native persistent capabilities.
+- Graceful test eviction waits for in-flight RPCs. Use the abrupt-reset helper when testing an
+  open replica's recovery boundary, rather than increasing timeouts to wait for it to drain.
 - Test real eviction and faults before dispatch, after effects but before ACK, after ACK but
   before local persistence, and during cleanup. Check both eventual progress and absence of
   duplicate effects, lost acknowledged edits or widened authority.

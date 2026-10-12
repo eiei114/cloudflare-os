@@ -31,6 +31,9 @@ Lifecycle contexts retain their participant's registration-time worktree selecti
 and resumed segments; they never acquire later-added bindings implicitly. Replica reads may include
 gadgets a spawned agent can inspect, but replica writes obey that chat's ordinary file-tool rules:
 spawned agents may modify worktrees, not gadget code. Both live and stored ingestion enforce this.
+For a gadget's first replica write after approval or eviction, the stored barrier establishes a pin
+against the lease's captured immutable base, just as the live path does. The ordinary barrier validates
+the head/pin and records its declaration, so the proposal can subsequently be accepted normally.
 
 Active continuations persist the initiating request before asynchronous startup, and each published
 integration segment records its execution identity. Recovery skips inference for a completed segment
@@ -38,6 +41,9 @@ only when its terminal journal belongs to that continuation; older cleanup canno
 If model recovery fails, terminal callbacks are journalled before active state is cleared and the alarm
 retries failed cleanup. Malformed model transforms are rejected before buffering and logged with only
 stage/count diagnostics, preserving their tool-error transcript instead of aborting at persistence.
+Content-free `agent.step.persist.*` and `agent.model.*` debug events share an execution ID and carry
+local sequence numbers and elapsed milliseconds. They distinguish a queued or blocked persistence
+barrier from a dispatched model request; stream creation is not receipt of provider response headers.
 
 ## Bootstrap and synchronization
 
@@ -69,9 +75,11 @@ Journal events tag each replica-owned OT row with its batch, including an empty 
 for no-op batches. Ordinary DO edits flushed at the same barrier are not tagged. Echo batch IDs
 are lease-local: another replica never mistakes a coincidentally equal batch ID for its own write.
 
-UTF-8 text attachments become ordinary worktree files; BOMs are preserved as content, and downloads
-read the original Git blob bytes. Rev 0 leaves non-UTF-8 attachments in the byte-preserving attachment
-store rather than silently substituting replacement characters into a text worktree.
+UTF-8 text attachments within the OT text-size limit become ordinary worktree files; BOMs are
+preserved as content, and downloads read the original Git blob bytes. Upload names reserve existing
+base and accepted/pending overlay root names, including directories, without reading their contents.
+Rev 0 leaves non-UTF-8 and oversized text attachments in the byte-preserving attachment store rather
+than creating lossy text or rejecting an otherwise valid upload at the OT persistence barrier.
 
 The bootstrap API preserves Git modes and binary base bytes. Rev 0 mutation submission is text
 only; it does not promise arbitrary binary/mode/Gitlink mutation support. A client cannot push

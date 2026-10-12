@@ -3,7 +3,7 @@ import {env} from "cloudflare:workers";
 import {abortAllDurableObjects, runInDurableObject} from "cloudflare:test";
 import type {OverseerDurableObject} from "../src/overseer";
 import type {UserDurableObject} from "../src/user";
-import {applyCodeChange, type CodeChange} from "@gadgets/workshop-shared/code-change";
+import {applyCodeChange, MAX_FILE_TEXT_LENGTH, type CodeChange} from "@gadgets/workshop-shared/code-change";
 import {replicaTextHash} from "../src/workspace-replica";
 import {runAgent} from "../src/agent";
 import {createFauxCore, fauxAssistantMessage, fauxText, fauxToolCall} from "@earendil-works/pi-ai";
@@ -52,6 +52,40 @@ async function open(impl: Impl, chatId = 1, gatekeeperId = 31) {
 }
 
 describe("replica review regressions over durable kernel storage", () => {
+  it.each(["edit", "set"])("pins a previously untouched gadget for a stored replica %s after suspension and reset", async mode => {
+    const name = crypto.randomUUID();
+    const saved = await inKernel(name, async impl => {
+      await worktree(impl);
+      const commit = await impl.gitStore.writeFilesAsCommit(new Map([["a.txt", "safe"]]), {
+        parents: [], author: {name: "Test", email: "test@example.com"}, message: "Gadget", timestamp: new Date(0),
+      });
+      const gadgetId = 100;
+      impl.storage.gadgets.put({type: "gadget", id: gadgetId, title: "Board", bindingName: "BOARD",
+        bindings: {}, created: new Date(0), commitId: commit});
+      impl.storage.chatContext.put({chatId: 1, bindings: {BOARD: gadgetId}, alwaysAvailableCapsuleIds: []});
+      impl.addChatMessages(1, USER, [{type: "message", message: "Edit the board in the container."}]);
+      await impl.beginAgentIntegrationTurn(1);
+      const replica = await open(impl), checkpoint = await replica.checkpoint();
+      await impl.closeAgentIntegrationTurn(1, "approval");
+      await impl.ctx.storage.sync();
+      return {gadgetId, commit, cursor: checkpoint.cursor};
+    });
+    await abortAllDurableObjects();
+    await inKernel(name, async impl => {
+      const {gadgetId, commit, cursor} = saved;
+      const replica = impl.getWorkspaceReplicaSession(cursor.split(":")[0]);
+      await replica.submitBatch({batchId: "stored-gadget", baseCursor: cursor, files: [
+        {checkoutId: gadgetId, path: "a.txt", baseHash: await replicaTextHash("safe"),
+          change: mode === "edit" ? {edit: [4, [0, "!"]]} : {set: "safe!"}},
+      ]});
+      const meta = impl.storage.chatMeta.get(1)!;
+      expect(impl.chatCodeBase(meta).pins).toContainEqual({gadgetId, baseCommit: commit, mergedCommit: commit});
+      expect((await impl.getCurrentChatContent(1, meta)).get(gadgetId)?.get("a.txt")).toBe("safe!");
+      expect(await impl.mergeChanges(1, {profile: USER}, USER.id)).toEqual({outcome: "merged"});
+      expect(await impl.readFileAtCommit(impl.getGadgetHead(gadgetId)!, "a.txt")).toBe("safe!");
+    });
+  });
+
   it.each(["set", "delete/recreate"])("preserves canonical %s replacement semantics against a concurrent edit", mode => inKernel(crypto.randomUUID(), async impl => {
     const tree = await worktree(impl, 1, new Map([["a.txt", "one\ntwo\n"]]));
     await impl.beginAgentIntegrationTurn(1);
@@ -260,4 +294,49 @@ describe("replica review regressions over durable kernel storage", () => {
       }
     }),
   );
+
+  it.each([false, true])("keeps an oversized text upload byte-backed (existing worktree: %s)", existing => inKernel(crypto.randomUUID(), async impl => {
+    const user = env.TEST_USER.getByName(crypto.randomUUID());
+    const stage = (data: Uint8Array, name: string) => {
+      const id = crypto.randomUUID();
+      impl.storage.chatAttachmentContent.put({fileId: id, data, state: {
+        type: "staged", uploadedAt: Date.now(), mimeType: "text/plain", name,
+      }});
+      return {id};
+    };
+    const bytes = new TextEncoder().encode("x".repeat(MAX_FILE_TEXT_LENGTH + 1));
+    const upload = stage(bytes, "large.txt");
+    const chatId = existing
+      ? await impl.newChat(user, {profile: USER}, "Initial", undefined, [stage(new TextEncoder().encode("small"), "small.txt")])
+      : await impl.newChat(user, {profile: USER}, "Read this", undefined, [upload]);
+    if (existing) await impl.sendChatMessage(user, {profile: USER}, chatId, "Read this", undefined, [upload]);
+    expect(await impl.getChatAttachmentData(chatId, upload.id)).toEqual(bytes);
+    expect(impl.storage.chatAttachmentContent.get(upload.id)?.state).toMatchObject({type: "committed", chatId});
+    expect(impl.storage.chatAttachmentContent.get(upload.id)?.state).not.toHaveProperty("workspacePath");
+    if (!existing) expect(impl.getChatAgentContext(chatId).attachments).toBeUndefined();
+    expect([...impl.storage.chats.list()].some(message => message.type === "message" &&
+      message.attachments?.some(attachment => attachment.id === upload.id))).toBe(true);
+  }));
+
+  it.each(["pending", "accepted", "directory"])("does not overwrite %s agent-created attachment-worktree paths", mode => inKernel(crypto.randomUUID(), async impl => {
+    const user = env.TEST_USER.getByName(crypto.randomUUID());
+    const stage = (text: string, name: string) => {
+      const id = crypto.randomUUID();
+      impl.storage.chatAttachmentContent.put({fileId: id, data: new TextEncoder().encode(text), state: {
+        type: "staged", uploadedAt: Date.now(), mimeType: "text/csv", name,
+      }});
+      return {id};
+    };
+    const chatId = await impl.newChat(user, {profile: USER}, "Initial", undefined, [stage("input", "input.csv")]);
+    const worktreeId = impl.getChatAgentContext(chatId).attachments!.worktreeId;
+    const generatedPath = mode === "directory" ? "report.csv/part.txt" : "report.csv";
+    await step(impl, chatId, {[worktreeId]: [[generatedPath, {set: "agent-created"}]]});
+    if (mode === "accepted") expect(await impl.mergeChanges(chatId, {profile: USER}, USER.id)).toEqual({outcome: "merged"});
+    const upload = stage("uploaded", "report.csv");
+    await impl.sendChatMessage(user, {profile: USER}, chatId, "Another attachment", undefined, [upload]);
+    expect(impl.storage.chatAttachmentContent.get(upload.id)?.state).toMatchObject({workspacePath: "report-2.csv"});
+    const content = await impl.getCurrentChatContent(chatId, impl.storage.chatMeta.get(chatId)!);
+    expect(content.get(worktreeId)?.get(generatedPath) ?? await impl.readFileAtCommit(impl.getWorktreePinBase(worktreeId)!, generatedPath)).toBe("agent-created");
+    expect(content.get(worktreeId)?.get("report-2.csv")).toBe("uploaded");
+  }));
 });

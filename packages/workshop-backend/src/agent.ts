@@ -2868,13 +2868,26 @@ async function runAgentPass(
   let workspaceRevision = 0;
   let stepBarrier: Promise<void> = Promise.resolve();
   let stepBarrierError: unknown;
+  const progressLogger = logger.with({chatId, executionId: crypto.randomUUID()});
+  let barrierSequence = 0;
   let persistStep = <T>(operation: () => Promise<T>): Promise<T> => {
-    let result = stepBarrier.then(() => {
+    const sequence = ++barrierSequence, queuedAt = Date.now();
+    progressLogger.debug("agent persistence queued", {event: "agent.step.persist.queued", sequence});
+    let result = stepBarrier.then(async () => {
       if (stepBarrierError !== undefined) throw stepBarrierError;
-      return operation();
+      progressLogger.debug("agent persistence started", {event: "agent.step.persist.started", sequence,
+        durationMs: Date.now() - queuedAt});
+      return await operation();
     });
     // A failed durability barrier is fatal, including to concurrently queued replica work.
-    stepBarrier = result.then(() => {}, error => { stepBarrierError = error; });
+    stepBarrier = result.then(() => {
+      progressLogger.debug("agent persistence completed", {event: "agent.step.persist.completed", sequence,
+        durationMs: Date.now() - queuedAt});
+    }, error => {
+      stepBarrierError = error;
+      progressLogger.debug("agent persistence failed", {event: "agent.step.persist.failed", sequence,
+        durationMs: Date.now() - queuedAt});
+    });
     return result;
   };
   let appendAgentEdit = (
@@ -4273,6 +4286,31 @@ async function runAgentPass(
     tools: toolList,
   };
 
+  let modelRequestSequence = 0;
+  const progressStream: ModelHandle["stream"] = (...args) => {
+    const sequence = ++modelRequestSequence, startedAt = Date.now();
+    progressLogger.debug("agent model request dispatched", {event: "agent.model.dispatch", sequence});
+    try {
+      const stream = handle.stream(...args);
+      // Creating a stream is not receipt of HTTP response headers. Its result settles only
+      // after inference; these breadcrumbs deliberately log no request/response/error text.
+      progressLogger.debug("agent model stream created", {event: "agent.model.stream.created", sequence});
+      void stream.result().then(message => {
+        progressLogger.debug("agent model request completed", {event: "agent.model.completed", sequence,
+          durationMs: Date.now() - startedAt,
+          outcome: message.stopReason === "error" || message.stopReason === "aborted" ? "error" : "ok"});
+      }, () => {
+        progressLogger.debug("agent model request failed", {event: "agent.model.failed", sequence,
+          durationMs: Date.now() - startedAt});
+      });
+      return stream;
+    } catch (error) {
+      progressLogger.debug("agent model dispatch failed", {event: "agent.model.failed", sequence,
+        durationMs: Date.now() - startedAt});
+      throw error;
+    }
+  };
+
   await runAgentLoopContinue(context, {
     model: handle.model,
     // Replay already produces LLM-shaped messages; no custom message types exist. The system
@@ -4317,7 +4355,7 @@ async function runAgentPass(
         return {action: "end"};
       }
     },
-  }, emit, abortSignal, handle.stream);
+  }, emit, abortSignal, progressStream);
 
   // Ordinary effects were barrier-committed with each completed step. The overseer's finally
   // also delivers persistent integration lifecycle events on cancellation or provider failure.

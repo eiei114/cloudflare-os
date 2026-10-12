@@ -2,7 +2,7 @@ import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import { Overseer, GadgetMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, GadgetClient, GadgetBindingInfo, GatekeeperClient, ActionLogEntry, ActionsSubscriber, ActionHistoryFilter, ActionHistoryPage, ChatGadgetPinRecord, MainlineMergeGadget, ChatCodeBase, ChatGadgetPinState, CodeChangeSubmission, CommitInfo, FileAtCommit, MAX_READ_FILES_PER_CALL, TreeNode, MergeChangesResult, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiToolCall, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, BlueprintMerge, ApplyBlueprintResult, GadgetUpstream, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintGadgetSummary, AiChatStreamEvent, BlueprintScreenshotUpload, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenGadgetError, OPEN_GADGET_ERROR_CODES, resolveSiteName, isTextLikeAttachmentMimeType } from '@gadgets/workshop-shared/api'
 import { applyCodeChange, changedGadgets, codeChangeSerializedSize, composeCodeChange,
-  transformCodeChange, validateCodeChangeContent, validateCodeChangeSchema,
+  MAX_FILE_TEXT_LENGTH, transformCodeChange, validateCodeChangeContent, validateCodeChangeSchema,
   type CodeContent, type CodeChange } from "@gadgets/workshop-shared/code-change";
 import { type AgentCatalog, Gatekeeper, GatekeeperUserVerifier, HookInitiator, ResourceDescription, ApprovalQueue, ActionDescription, ObservationAuthorizer, ObservationDescription, VendorDescription, SupportedResource, resolveRequestedResource, HookController, HookDescription, ActionKind, GitCache, GitPullHints } from "@gadgets/workshop-shared/gatekeeper";
 import {
@@ -5506,14 +5506,23 @@ class OverseerImpl implements AgentHooks {
     return candidate;
   }
 
-  #prepareWorkspaceAttachmentFiles(
-      chatId: number, attachments: ChatAttachmentRef[] | undefined): Map<string, string> {
+  async #prepareWorkspaceAttachmentFiles(
+      chatId: number, attachments: ChatAttachmentRef[] | undefined): Promise<Map<string, string>> {
     let used = new Set<string>();
     for (let record of this.storage.chatAttachmentContent.list()) {
       if (record.state.type === "committed" && record.state.chatId === chatId &&
           record.state.workspacePath !== undefined) {
         used.add(record.state.workspacePath);
       }
+    }
+
+    const worktree = this.#attachmentsWorktree(chatId);
+    if (worktree && attachments?.some(attachment => isTextLikeAttachmentMimeType(attachment.mimeType))) {
+      // Uploads use root filenames. Reserve base and overlay root names (including directories)
+      // without loading file contents, so an upload cannot overwrite agent-created work.
+      for (const entry of await this.gitCache.listCommitTreePaths(worktree.pinBase)) used.add(entry.path);
+      for (const {path} of this.storage.worktreeBaseChanges.byWorkpiece.get(worktree.id)) used.add(path.split("/")[0]);
+      for (const [path] of this.#replicaOverlay(chatId)[worktree.id] ?? []) used.add(path.split("/")[0]);
     }
 
     let files = new Map<string, string>();
@@ -5523,12 +5532,13 @@ class OverseerImpl implements AgentHooks {
       if (!content || content.state.type !== "staged") {
         throw new Error("Chat attachment is no longer available.");
       }
-      let path = this.#attachmentWorkspaceFilename(attachment, used);
       // The OT engine is UTF-16 text. Invalid UTF-8 stays an ordinary byte attachment,
       // never a lossy replacement-character worktree. Keep a UTF-8 BOM as actual content.
       let text: string;
       try { text = new TextDecoder("utf-8", {fatal: true, ignoreBOM: true}).decode(content.data); }
       catch { continue; }
+      if (text.length > MAX_FILE_TEXT_LENGTH) continue;
+      let path = this.#attachmentWorkspaceFilename(attachment, used);
       attachment.workspacePath = path;
       files.set(path, text);
     }
@@ -6574,8 +6584,19 @@ class OverseerImpl implements AgentHooks {
         const active = this.#worktreeReplicaTurns.get(lease.chatId);
         try {
           if (active?.access.flushReplica) return await active.access.flushReplica(change, active.access.getRevision?.() ?? 0, receipt);
+          // A suspended/recovered turn needs the same first-write gadget pins as the live path.
+          // Use the lease's immutable base, never a newer mainline head; the barrier validates it.
+          const pins = this.chatCodeBase(this.storage.chatMeta.get(lease.chatId)!).pins;
+          const changes: AgentStepChange[] = Object.entries(change).map(([key, entries]) => {
+            const gadgetId = Number(key), isWorktree = this.isWorktree(gadgetId);
+            assertAgentMayModifyWorkpiece(this.getChatAgentContext(lease.chatId), isWorktree);
+            const baseCommit = lease.worktrees.find(tree => tree.checkoutId === gadgetId)?.baseCommit;
+            return {change: {[gadgetId]: entries}, replica: true,
+              ...(!isWorktree && baseCommit && !pins.some(pin => pin.gadgetId === gadgetId)
+                ? {pin: {gadgetId, baseCommit}} : {})};
+          });
           return await this.commitAgentStep(lease.chatId, { type: "agent", id: lease.gatekeeperId.toString(), name: "Worktree replica" }, [], {
-            changes: Object.keys(change).length ? [{change, replica: true}] : [], createdGadgets: [], createdWorktrees: [],
+            changes, createdGadgets: [], createdWorktrees: [],
             addedBindings: [], worktreeCommits: [], blueprintMerges: [], replicaCommit: receipt, replicaExpectedVersion: version });
         } catch (error) { if (error instanceof ReplicaChangedError) return false; throw error; }
       },
@@ -7044,7 +7065,7 @@ class OverseerImpl implements AgentHooks {
     // modified in the chat (see ChatCodeBase). Until then the chat reads committed code live at
     // each gadget's current head.
     let chatId = this.nextChatId();
-    let attachmentFiles = this.#prepareWorkspaceAttachmentFiles(chatId, canonicalAttachments);
+    let attachmentFiles = await this.#prepareWorkspaceAttachmentFiles(chatId, canonicalAttachments);
     let attachmentsWorktree = await this.#prepareAttachmentsWorktree(
         chatId, attachmentFiles, userMeta.profile);
     let timestamp = this.getChatTimestamp();
@@ -7126,7 +7147,7 @@ class OverseerImpl implements AgentHooks {
     let prepared = await this.#prepareChatMessage(
         message, (canonicalAttachments?.length ?? 0) > 0);
 
-    let attachmentFiles = this.#prepareWorkspaceAttachmentFiles(chatId, canonicalAttachments);
+    let attachmentFiles = await this.#prepareWorkspaceAttachmentFiles(chatId, canonicalAttachments);
     let attachmentsWorktree = this.#attachmentsWorktree(chatId);
     let preparedAttachmentsWorktree: PreparedAttachmentsWorktree | undefined;
     let attachmentSourceCommit: string | undefined;
