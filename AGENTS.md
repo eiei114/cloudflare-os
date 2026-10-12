@@ -1,5 +1,29 @@
 This project is building a platform for "vibe coded" personal applications and AI agents that run inside a strong sandbox.
 
+## Durable Object reset discipline
+
+Durable Objects reset frequently, including during long RPC calls. Treat resets as a normal
+operating condition for every feature, not just a deployment event.
+
+- Persist workflow identity, authorized intent, progress, receipts and retry deadlines before
+  asynchronous effects. In-memory promises, timers, locks and RPC handles are disposable; use
+  durable alarms/outboxes to reconstruct progress without another browser request.
+- A lost response does not mean an operation failed. Reconcile stable effect IDs and durable
+  receipts before retrying. Never blindly repeat non-idempotent effects across an unjournalled
+  boundary; surface an indeterminate outcome when safe reconciliation is impossible.
+- Recovery retains the original approval, caller, logical turn and resource scope. Recheck
+  revocation; never borrow a later turn's authority. Fence cleanup against new work and persist
+  checkpoint results before releasing leases or destroying external resources.
+- Persistent capabilities must be minted by the DO invocation that stores them. Test-pool
+  wrappers and another DO's I/O handles cannot substitute for native persistent capabilities.
+- Test real eviction and faults before dispatch, after effects but before ACK, after ACK but
+  before local persistence, and during cleanup. Check both eventual progress and absence of
+  duplicate effects, lost acknowledged edits or widened authority.
+- Log bounded lifecycle/recovery identities, state and timings, never prompts, commands,
+  credentials or file contents. Document unavoidable loss/ambiguity boundaries explicitly.
+
+For the generic integration/replica contract, see `docs/agent-worktree-replicas.md`.
+
 The following files are commonly important to reference:
 
 * packages/workshop-shared/node_modules/capnweb/README.md: Explains how to use Cap'n Web RPC, which is used extensively for client-server communications.
