@@ -80,7 +80,7 @@ import {
   normalizeTagSummary,
 } from "./git-commits";
 import GITHUB_LOGO_SVG from "./github-logo.svg";
-import { validateBootstrapFetch } from "./git-bootstrap";
+import { validateBootstrapFetch } from "@gadgets/gatekeeper-kit/git-bootstrap";
 import type {
   GitHubActor,
   GitHubBranchFilter,

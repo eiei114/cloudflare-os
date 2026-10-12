@@ -1,6 +1,10 @@
 import { PktLineParser } from "./git-transport";
 
-/** Only the granted immutable commit can be requested, never ref discovery or another object. */
+/**
+ * Validate a native Git v2 shallow fetch of the immutable commit granted by the kernel.
+ * Reject ref discovery, other objects/commands, malformed framing, and requests over 64 KiB.
+ * The provider still owns project scoping, authentication, and the streaming HTTP transport.
+ */
 export function validateBootstrapFetch(commit: string, request: Uint8Array): void {
   if (!/^[a-f0-9]{40}$/.test(commit) || request.byteLength > 64 * 1024) {
     throw new Error("Invalid bootstrap fetch.");
@@ -25,7 +29,7 @@ export function validateBootstrapFetch(commit: string, request: Uint8Array): voi
       done = true;
       continue;
     }
-    if (packet.kind !== "data" || done) throw new Error("Invalid fetch framing.");
+    if (packet.kind !== "data") throw new Error("Invalid fetch framing.");
     const line = decoder.decode(packet.data).replace(/\n$/, "");
     if (!argumentsStarted) {
       if (line === "command=fetch" && !command) command = true;
@@ -33,11 +37,7 @@ export function validateBootstrapFetch(commit: string, request: Uint8Array): voi
         throw new Error("Unsupported Git bootstrap command.");
     } else if (line === `want ${commit}` && !want) want = true;
     else if (line === "deepen 1" && !shallow) shallow = true;
-    else if (
-      !/^(done|thin-pack|ofs-delta|no-progress|include-tag|sideband-all|have [a-f0-9]{40})$/.test(
-        line,
-      )
-    ) {
+    else if (!/^(done|thin-pack|ofs-delta|no-progress|include-tag|sideband-all|have [a-f0-9]{40})$/.test(line)) {
       throw new Error("Git bootstrap may fetch only its granted commit.");
     }
   }

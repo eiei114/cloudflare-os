@@ -32,7 +32,10 @@ executing under a new user prompt.
    worktrees have collision-free mounts; attachments are ordinary indexed worktree content.
 3. Enumerate and stream base bytes separately from the transform overlay. No whole-repository
    content buffer or base64 transfer is introduced. A provider may alternatively serve a
-   validated native Git v2 pack for the already-advertised exact base commit. Source credentials
+   validated native Git v2 pack for the already-advertised exact base commit. GitHub and GitLab
+   implement this through the shared gatekeeper-kit validator and their authenticated
+   upload-pack transports, including configured Access credentials for self-hosted GitLab.
+   Source credentials
    and unrelated repository grants never enter the replica; Git bootstrap is explicitly closed
    before exposing it for agent commands.
 4. Replay ordered canonical events through `changesSince()`. A receipt's acceptance marker is
@@ -59,3 +62,16 @@ Workerd tests cover contextual recovery, outbox eviction, grant/revocation check
 binary RPC transfer, anchored batch deduplication and deterministic bidirectional collisions.
 The native Git bootstrap fixture uses a separate real Git server. Kernel transfer fixtures are
 independent sinks: they do not import a private integration package.
+
+## Storage and porting
+
+Integration journals, leases, receipts, repository identities, and attachment references live in
+`storage-schema/overseer-storage.ts`. Schema version 6 adds their empty collections without
+eagerly fetching repository contents; existing repository identities are allocated on first use.
+Replica overlays use the same compacted-history fold as agent replay, followed by live OT rows,
+so bootstrap retains edits across chat compaction.
+
+Bootstrap adapters validate the immutable commit before contacting upstream and return the
+binary response stream directly. Native Git tests belong in gatekeeper-kit; provider workerd
+tests cover authentication, project scope, failures, and streaming. DO cache pulls are a separate
+protocol path and must not inherit native Git's `have` negotiation semantics.
