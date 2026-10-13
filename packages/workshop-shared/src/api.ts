@@ -446,10 +446,28 @@ export type UserDirectoryRecord = {
   name: string;
 };
 
+/** Routing identity and one-use proof posted by the authenticated browser to redeem a transfer. */
+export type DeviceSessionHandoffStart = {
+  /** Durable Object identifier for the staging user; this value is not secret. */
+  userDoId: string;
+  /** Single-use 256-bit secret in lowercase hex; only its hash is stored server-side. */
+  ticket: string;
+};
+
 /** Top-level API exposed to the user after they have authenticated. */
 export interface AuthenticatedApi extends RpcTarget {
   /** Get profile info for the user who is logged in. */
   whoami(): Promise<AiChatAuthorInfo>;
+
+  /**
+   * Stage a two-minute, single-use device-session transfer for a native app. The state is an
+   * opaque 16–512 character URL-safe value and the key is an uncompressed P-256 public key encoded
+   * as unpadded base64url. The encrypted credential remains server-side until the browser POSTs
+   * the returned ticket to `/api/device-session/callback`, which redirects to the fixed, claimed
+   * HTTPS app link. Repeating a live state reissues its ticket and invalidates the previous one.
+   */
+  beginDeviceSessionHandoff(publicKey: string, state: string)
+    : Promise<DeviceSessionHandoffStart>;
 
   /** Set the user's own display name, seen in chats, etc. */
   setOwnDisplayName(name: string): Promise<void>;

@@ -32,6 +32,7 @@ import { resolveUiFeatureFlags } from "./feature-flags";
 import { serveSiteLogo, SITE_LOGO_PATH } from "./site-logo.js";
 import { createWorkshopLogger } from "./observability";
 import { retryOnDoReset, wrapDoStubForTelemetry } from "./do-retry";
+import { deviceSessionCallback } from "./auth/device-session-callback.js";
 
 const logger = createWorkshopLogger("workshop.server");
 
@@ -84,7 +85,8 @@ type Env = Cloudflare.Env & {
 class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   constructor(private ctx: ExecutionContext, private env: Env,
       userId: DurableObjectId,
-      private abortSession: (reason: Error) => void) {
+      private abortSession: (reason: Error) => void,
+      private accessSession?: { jwt: string; expiresAt: number }) {
     super();
 
     this.#userId = userId;
@@ -141,6 +143,15 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   whoami(): Promise<AiChatAuthorInfo> {
     // Pure-read delegations retry once across a user-DO reset (see retryOnDoReset); writes never do.
     return retryOnDoReset(() => this.#user.whoami());
+  }
+  async beginDeviceSessionHandoff(publicKey: string, state: string) {
+    if (this.accessSession?.expiresAt !== undefined &&
+        this.accessSession.expiresAt <= Date.now()) {
+      throw new Error("The Access session has expired. Sign in again before connecting the app.");
+    }
+    const result = await this.#user.stageDeviceSessionHandoff(
+        publicKey, state, this.accessSession?.jwt);
+    return result;
   }
   setOwnDisplayName(name: string): Promise<void> {
     return this.#user.setOwnDisplayName(name);
@@ -682,7 +693,7 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
 
   constructor(private ctx: ExecutionContext, private env: Env,
       private abortSession: (reason: Error) => void,
-      private accessPayload?: JWTPayload) {
+      private accessSession?: { payload: JWTPayload; jwt: string }) {
     super();
     this.users = this.ctx.exports.UserDurableObject;
   }
@@ -754,11 +765,11 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
   }
 
   async authenticateFromCfAccess(): Promise<AuthenticatedApi> {
-    if (!this.accessPayload) {
+    if (!this.accessSession) {
       throw createAuthError(AUTH_ERROR_CODES.notAuthenticatedWithAccess);
     }
 
-    let email = this.accessPayload.email as string;
+    let email = this.accessSession.payload.email as string;
     let userId = this.users.idFromName(email);
     let signupsEnabled = (await readAdminConfig(this.env)).signupsEnabled;
     let accountCreated =
@@ -775,7 +786,8 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
       user_id: userId.toString(),
       source: "cf_access",
     });
-    return new AuthenticatedApiImpl(this.ctx, this.env, userId, this.abortSession);
+    return new AuthenticatedApiImpl(this.ctx, this.env, userId, this.abortSession,
+        { jwt: this.accessSession.jwt, expiresAt: (this.accessSession.payload.exp ?? 0) * 1000 });
   }
 
   async login(username: string, passwordHash: Uint8Array): Promise<string | null> {
@@ -873,6 +885,29 @@ export default {
       return handleClientErrorRequest(req, env, ctx);
     }
 
+    if (url.pathname === "/api/device-session/callback") {
+      let expectedUserDoId: string | undefined;
+      if (env.CF_ACCESS_AUD) {
+        const payload = await verifyCfAccessJwt(req, env);
+        if (typeof payload?.email !== "string" || payload.email.length === 0) {
+          return new Response("Invalid CF access JWT.", {
+            status: 403,
+            headers: { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+          });
+        }
+        expectedUserDoId = ctx.exports.UserDurableObject.idFromName(payload.email).toString();
+      }
+      return deviceSessionCallback(req, async (userDoId, state, ticket) => {
+        let id: DurableObjectId;
+        try {
+          id = ctx.exports.UserDurableObject.idFromString(userDoId);
+        } catch {
+          return null;
+        }
+        return await ctx.exports.UserDurableObject.get(id).consumeDeviceSessionHandoff(state, ticket);
+      }, expectedUserDoId);
+    }
+
     if (url.pathname === "/api") {
       // Make sure the bundled blueprints are installed. The AdminSettings DO doesn't wake
       // merely because someone deployed, so the install needs a trigger; hanging it off API
@@ -897,7 +932,7 @@ export default {
             }));
       }
 
-      let accessPayload: JWTPayload | undefined;
+      let accessSession: { payload: JWTPayload; jwt: string } | undefined;
 
       if (env.CF_ACCESS_AUD) {
         if (req.headers.get("Origin") !== url.origin) {
@@ -911,7 +946,10 @@ export default {
           return new Response("Access JWT didn't specify email address.", { status: 403 });
         }
 
-        accessPayload = payload;
+        accessSession = {
+          payload,
+          jwt: req.headers.get("cf-access-jwt-assertion")!,
+        };
       }
 
       // HACK: Implement `abortSession` callback by closing the websocket.
@@ -924,7 +962,7 @@ export default {
       };
 
       return await newWorkersRpcResponse(req,
-          new PublicApiImpl(ctx, env, abortSession, accessPayload),
+          new PublicApiImpl(ctx, env, abortSession, accessSession),
           { abortSignal: abortController.signal });
     }
 
