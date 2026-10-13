@@ -39,6 +39,10 @@ catalog:
   zod: ^4.6.5
 
 overrides:
+  nanoid@3: 3.3.18
+  source-map-js: 1.2.2
+  ip-address: 10.7.1
+  basic-ftp: 6.2.1
   # Keep the test pool's Wrangler/Miniflare/workerd stack aligned with the workspace toolchain.
   '@cloudflare/vitest-pool-workers>miniflare': "catalog:"
   '@cloudflare/vitest-pool-workers>wrangler': "catalog:"
@@ -73,3 +77,6 @@ allowBuilds:
   protobufjs: true
   sharp: true
   workerd: true
+
+patchedDependencies:
+  extract-zip@2.0.1: patches/extract-zip@2.0.1.patch
